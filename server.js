@@ -7,6 +7,7 @@ const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const path = require('path');
+const fs = require('fs');
 const { OAuth2Client } = require('google-auth-library');
 const sendAdminEmail = require("./utils/mailer");
 
@@ -40,16 +41,38 @@ const googleClients = {
   ios: new OAuth2Client(GOOGLE_CLIENT_IDS.ios)
 };
 
+// Ensure uploads directory exists
+const uploadsDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+  console.log('Created uploads directory');
+}
+
 // File upload configuration
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     cb(null, 'uploads/');
   },
   filename: (req, file, cb) => {
-    cb(null, Date.now() + '-' + file.originalname);
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, uniqueSuffix + '-' + file.originalname);
   }
 });
-const upload = multer({ storage });
+
+const upload = multer({ 
+  storage,
+  limits: {
+    fileSize: 10 * 1024 * 1024 // 10MB limit
+  },
+  fileFilter: (req, file, cb) => {
+    // Accept images only
+    if (file.mimetype.startsWith('image/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only image files are allowed!'), false);
+    }
+  }
+});
 
 // Connect DB
 mongoose.connect(atlasUri)
@@ -257,7 +280,7 @@ setInterval(async () => {
         await new Notification({
           userId: driver.userId,
           title: "Auto Deactivated",
-          message: "You've been automatically deactivated due to 10 hours of inactivity",
+          message: "You've been automatically deactivated due to inactivity. Please reactivate when available.",
           type: 'status'
         }).save();
       }
@@ -267,294 +290,260 @@ setInterval(async () => {
   }
 }, 60 * 60 * 1000); // Run every hour
 
-// ==================== AUTHENTICATION ROUTES ====================
+// ==================== AUTH ROUTES ====================
 
-// REGISTER - Traditional Email/Password
+// REGISTER
 app.post('/register', async (req, res) => {
   try {
     const { name, email, password, role } = req.body;
-
-    if (!['admin', 'customer', 'driver'].includes(role)) {
-      return res.status(400).json({ error: "Invalid role" });
+    
+    if (!name || !email || !password || !role) {
+      return res.status(400).json({ error: "All fields required" });
     }
-
-    // Check if user exists
+    
     const existingUser = await User.findOne({ email });
     if (existingUser) {
-      return res.status(400).json({ error: "Email already exists" });
+      return res.status(400).json({ error: "User already exists" });
     }
-
-    // Hash password
+    
     const hashedPassword = await bcrypt.hash(password, 10);
-
-    // Create user in both collections
+    
     const newUser = await createUserWithRole({
       name,
       email,
       password: hashedPassword,
-      role,
-      authProvider: 'local'
+      role
     });
-
-    // Generate JWT
+    
     const token = jwt.sign(
       { userId: newUser._id, role: newUser.role },
       JWT_SECRET,
-      { expiresIn: "7d" }
+      { expiresIn: '30d' }
     );
-
+    
     res.status(201).json({
-      message: "User Registered Successfully",
+      message: "User registered successfully",
       token,
-      role: newUser.role,
-      userId: newUser._id,
-      name: newUser.name
+      user: {
+        id: newUser._id,
+        name: newUser.name,
+        email: newUser.email,
+        role: newUser.role
+      }
     });
   } catch (err) {
     console.error("REGISTER ERROR:", err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// LOGIN - Traditional Email/Password
-app.post('/login', async (req, res) => {
-  try {
-    const { email, password } = req.body;
-
-    // Fast indexed search in Users collection
-    const user = await User.findOne({ email });
-    if (!user) {
-      return res.status(400).json({ error: "Invalid credentials" });
-    }
-
-    // Check if user registered with Google
-    if (user.authProvider === 'google' && !user.password) {
-      return res.status(400).json({ 
-        error: "This account uses Google Sign-In. Please sign in with Google." 
-      });
-    }
-
-    // Verify password
-    const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) {
-      return res.status(400).json({ error: "Invalid credentials" });
-    }
-
-    // Generate JWT
-    const token = jwt.sign(
-      { userId: user._id, role: user.role },
-      JWT_SECRET,
-      { expiresIn: "7d" }
-    );
-
-    res.json({ 
-      token, 
-      role: user.role,
-      userId: user._id,
-      name: user.name
-    });
-  } catch (err) {
-    console.error("LOGIN ERROR:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
 
-// GOOGLE SIGN-IN (Login)
-app.post('/google-login', async (req, res) => {
+// LOGIN
+app.post('/login', async (req, res) => {
   try {
-    const { idToken, email, name, photoUrl, platform } = req.body; // platform: 'web', 'android', or 'ios'
-
-    // Determine which platform client to use
-    const platformType = platform || 'android'; // default to android
-    const googleClient = googleClients[platformType];
-    const clientId = GOOGLE_CLIENT_IDS[platformType];
-
-    if (!googleClient || !clientId) {
-      return res.status(400).json({ 
-        error: 'Invalid platform specified. Use: web, android, or ios' 
-      });
-    }
-
-    // Verify Google token with appropriate client
-    let googleId;
-    let verifiedEmail = email;
+    const { email, password } = req.body;
     
-    try {
-      const ticket = await googleClient.verifyIdToken({
-        idToken,
-        audience: clientId,
-      });
-      const payload = ticket.getPayload();
-      googleId = payload.sub;
-      verifiedEmail = payload.email || email;
-      
-      console.log(`✅ Google token verified for ${platformType} platform`);
-      
-    } catch (verifyError) {
-      console.error(`Token verification failed for ${platformType}:`, verifyError.message);
-      // Continue with email-based lookup even if verification fails
+    if (!email || !password) {
+      return res.status(400).json({ error: "Email and password required" });
     }
-
-    // Check if user exists (indexed search by email or googleId)
-    let user = await User.findOne({ 
-      $or: [
-        { email: verifiedEmail },
-        ...(googleId ? [{ googleId }] : [])
-      ]
-    });
-
+    
+    const user = await User.findOne({ email });
     if (!user) {
-      return res.status(404).json({ 
-        error: 'Account not found. Please register first.',
-        needsRegistration: true 
+      return res.status(400).json({ error: "Invalid credentials" });
+    }
+    
+    if (user.authProvider === 'google') {
+      return res.status(400).json({ 
+        error: "This email is registered with Google. Please use Google Sign-In" 
       });
     }
-
-    // Update Google ID and photo if not set
-    if (googleId && !user.googleId) {
-      user.googleId = googleId;
-      user.photoUrl = photoUrl;
-      user.authProvider = 'google';
-      await user.save();
-      
-      // Update profile photo in role-specific collection
-      if (user.role === 'driver') {
-        await Driver.findOneAndUpdate(
-          { userId: user._id },
-          { profilePhoto: photoUrl }
-        );
-      }
+    
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) {
+      return res.status(400).json({ error: "Invalid credentials" });
     }
-
-    // Generate JWT
+    
     const token = jwt.sign(
       { userId: user._id, role: user.role },
       JWT_SECRET,
-      { expiresIn: '7d' }
+      { expiresIn: '30d' }
     );
-
+    
     res.json({
       token,
-      userId: user._id,
-      name: user.name,
-      role: user.role,
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        photoUrl: user.photoUrl
+      }
     });
-
-  } catch (error) {
-    console.error('Google login error:', error);
-    res.status(500).json({ error: 'Google login failed' });
+  } catch (err) {
+    console.error("LOGIN ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
   }
 });
 
-// GOOGLE SIGN-UP (Register)
-app.post('/google-register', async (req, res) => {
+// GOOGLE SIGN-IN
+app.post('/google-signin', async (req, res) => {
   try {
-    const { idToken, email, name, photoUrl, role, platform } = req.body;
-
-    if (!role || !['admin', 'customer', 'driver'].includes(role)) {
-      return res.status(400).json({ error: 'Valid role is required (customer, driver, or admin)' });
-    }
-
-    // Determine which platform client to use
-    const platformType = platform || 'android'; // default to android
-    const googleClient = googleClients[platformType];
-    const clientId = GOOGLE_CLIENT_IDS[platformType];
-
-    if (!googleClient || !clientId) {
-      return res.status(400).json({ 
-        error: 'Invalid platform specified. Use: web, android, or ios' 
-      });
-    }
-
-    // Verify Google token with appropriate client
-    let googleId;
-    let verifiedEmail = email;
+    const { idToken, role, platform = 'android' } = req.body;
     
-    try {
-      const ticket = await googleClient.verifyIdToken({
-        idToken,
-        audience: clientId,
+    if (!idToken || !role) {
+      return res.status(400).json({ error: "ID token and role required" });
+    }
+
+    let ticket;
+    let payload;
+    
+    // Try each platform's client
+    const clientsToTry = [
+      googleClients[platform],
+      googleClients.android,
+      googleClients.ios,
+      googleClients.web
+    ];
+
+    for (const client of clientsToTry) {
+      try {
+        ticket = await client.verifyIdToken({
+          idToken,
+          audience: client._clientId
+        });
+        payload = ticket.getPayload();
+        break;
+      } catch (err) {
+        continue;
+      }
+    }
+
+    if (!payload) {
+      return res.status(401).json({ error: "Invalid Google token" });
+    }
+
+    const { sub: googleId, email, name, picture } = payload;
+    
+    let user = await User.findOne({ email });
+    
+    if (user) {
+      if (user.authProvider === 'local') {
+        return res.status(400).json({ 
+          error: "This email is registered with password. Please use email/password login" 
+        });
+      }
+      
+      if (user.role !== role) {
+        return res.status(400).json({ 
+          error: `This email is registered as ${user.role}. Please sign in with correct role.` 
+        });
+      }
+    } else {
+      user = await createUserWithRole({
+        name,
+        email,
+        googleId,
+        photoUrl: picture,
+        role,
+        authProvider: 'google'
       });
-      const payload = ticket.getPayload();
-      googleId = payload.sub;
-      verifiedEmail = payload.email || email;
-      
-      console.log(`✅ Google token verified for ${platformType} platform`);
-      
-    } catch (verifyError) {
-      console.error(`Token verification failed for ${platformType}:`, verifyError.message);
-      // Continue with email from request if verification fails
     }
-
-    // Check if user already exists
-    const existingUser = await User.findOne({ 
-      $or: [
-        { email: verifiedEmail },
-        ...(googleId ? [{ googleId }] : [])
-      ]
-    });
-
-    if (existingUser) {
-      return res.status(400).json({ error: 'Email already registered' });
-    }
-
-    // Create user in both collections (Users + role-specific)
-    const newUser = await createUserWithRole({
-      name,
-      email: verifiedEmail,
-      password: null, // No password for Google auth
-      role,
-      googleId,
-      photoUrl,
-      authProvider: 'google'
-    });
-
-    // Generate JWT
+    
     const token = jwt.sign(
-      { userId: newUser._id, role: newUser.role },
+      { userId: user._id, role: user.role },
       JWT_SECRET,
-      { expiresIn: '7d' }
+      { expiresIn: '30d' }
     );
-
-    res.status(201).json({
-      message: "User Registered Successfully with Google",
+    
+    res.json({
       token,
-      userId: newUser._id,
-      name: newUser.name,
-      role: newUser.role,
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        photoUrl: user.photoUrl
+      }
     });
-  } catch (error) {
-    console.error('Google registration error:', error);
-    res.status(500).json({ error: 'Google registration failed' });
+  } catch (err) {
+    console.error("GOOGLE SIGNIN ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
   }
 });
 
 // ==================== DRIVER ROUTES ====================
 
-// UPLOAD PROFILE PHOTO
-app.post('/driver/upload-profile', authMiddleware, upload.single('photo'), async (req, res) => {
-  try {
-    if (req.userRole !== 'driver') {
-      return res.status(403).json({ error: "Only drivers can upload profile photos" });
+// UPLOAD PROFILE PHOTO - FIXED VERSION
+app.post('/driver/upload-profile', authMiddleware, (req, res) => {
+  // Use multer middleware
+  upload.single('photo')(req, res, async (err) => {
+    try {
+      // Check for multer errors
+      if (err instanceof multer.MulterError) {
+        console.error('Multer error:', err);
+        if (err.code === 'LIMIT_FILE_SIZE') {
+          return res.status(400).json({ error: 'File too large. Maximum size is 10MB' });
+        }
+        return res.status(400).json({ error: `Upload error: ${err.message}` });
+      } else if (err) {
+        console.error('Upload error:', err);
+        return res.status(400).json({ error: err.message });
+      }
+
+      // Check if user is a driver
+      if (req.userRole !== 'driver') {
+        return res.status(403).json({ error: "Only drivers can upload profile photos" });
+      }
+
+      // Check if file was uploaded
+      if (!req.file) {
+        console.error('No file in request');
+        return res.status(400).json({ error: "No photo file uploaded. Please select a photo." });
+      }
+
+      // Find driver
+      const driver = await Driver.findOne({ userId: req.userId });
+      if (!driver) {
+        // Clean up uploaded file if driver not found
+        if (req.file && req.file.path) {
+          fs.unlinkSync(req.file.path);
+        }
+        return res.status(404).json({ error: "Driver not found" });
+      }
+
+      // Delete old profile photo if exists
+      if (driver.profilePhoto) {
+        const oldPhotoPath = path.join(__dirname, 'uploads', driver.profilePhoto);
+        if (fs.existsSync(oldPhotoPath)) {
+          fs.unlinkSync(oldPhotoPath);
+        }
+      }
+
+      // Update driver profile
+      driver.profilePhoto = req.file.filename;
+      driver.isApproved = true; // Auto-approve after photo upload
+      await driver.save();
+
+      console.log('Profile photo uploaded successfully:', req.file.filename);
+
+      res.json({ 
+        message: "Profile photo uploaded successfully",
+        profilePhoto: driver.profilePhoto,
+        isApproved: true,
+        photoUrl: `/uploads/${driver.profilePhoto}`
+      });
+    } catch (error) {
+      console.error('Server error during profile upload:', error);
+      // Clean up uploaded file on error
+      if (req.file && req.file.path) {
+        try {
+          fs.unlinkSync(req.file.path);
+        } catch (unlinkErr) {
+          console.error('Error deleting file:', unlinkErr);
+        }
+      }
+      res.status(500).json({ error: "Server error during upload" });
     }
-
-    const driver = await Driver.findOne({ userId: req.userId });
-    if (!driver) {
-      return res.status(404).json({ error: "Driver not found" });
-    }
-
-    driver.profilePhoto = req.file.filename;
-    driver.isApproved = true; // Auto-approve after photo upload
-    await driver.save();
-
-    res.json({ 
-      message: "Profile photo uploaded successfully",
-      profilePhoto: driver.profilePhoto,
-      isApproved: true
-    });
-  } catch (err) {
-    res.status(500).json({ error: "Server error" });
-  }
+  });
 });
 
 // GET DRIVER PROFILE STATUS
@@ -573,9 +562,11 @@ app.get('/driver/profile-status', authMiddleware, async (req, res) => {
       hasProfilePhoto: !!driver.profilePhoto,
       isApproved: driver.isApproved,
       isActive: driver.isActive,
-      canActivate: driver.isApproved && driver.profilePhoto
+      canActivate: driver.isApproved && driver.profilePhoto,
+      profilePhoto: driver.profilePhoto ? `/uploads/${driver.profilePhoto}` : null
     });
   } catch (err) {
+    console.error('Profile status error:', err);
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -602,8 +593,12 @@ app.put('/driver/toggle-status', authMiddleware, async (req, res) => {
     driver.lastActiveAt = new Date();
     await driver.save();
 
-    res.json({ isActive: driver.isActive });
+    res.json({ 
+      message: driver.isActive ? "You are now active" : "You are now inactive",
+      isActive: driver.isActive 
+    });
   } catch (err) {
+    console.error('Toggle status error:', err);
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -616,6 +611,10 @@ app.post('/driver/update-location', authMiddleware, async (req, res) => {
     }
 
     const { latitude, longitude } = req.body;
+    
+    if (!latitude || !longitude) {
+      return res.status(400).json({ error: "Latitude and longitude required" });
+    }
 
     const driver = await Driver.findOne({ userId: req.userId });
     if (!driver) {
@@ -627,27 +626,32 @@ app.post('/driver/update-location', authMiddleware, async (req, res) => {
       longitude,
       updatedAt: new Date()
     };
+    driver.lastActiveAt = new Date();
     await driver.save();
 
-    // Update location in active assignments
+    // Update location in active orders
     await Order.updateMany(
       { 
         'assignments.driverId': driver._id,
-        'assignments.status': { $in: ['assigned', 'in_transit'] }
+        status: { $in: ['assigned', 'in_transit'] }
       },
       { 
         $set: { 
-          'assignments.$.currentLocation': {
+          'assignments.$[elem].currentLocation': {
             latitude,
             longitude,
             updatedAt: new Date()
           }
         }
+      },
+      {
+        arrayFilters: [{ 'elem.driverId': driver._id }]
       }
     );
 
     res.json({ message: "Location updated" });
   } catch (err) {
+    console.error('Location update error:', err);
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -664,39 +668,54 @@ app.get('/driver/dashboard', authMiddleware, async (req, res) => {
       return res.status(404).json({ error: "Driver not found" });
     }
 
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    
-    const allOrders = await Order.find({ 
-      'assignments.driverId': driver._id 
+    // Get active orders
+    const activeOrders = await Order.find({
+      'assignments.driverId': driver._id,
+      status: { $ne: 'completed' }
     }).sort({ createdAt: -1 });
-    
-    const todayRides = allOrders.filter(order => {
-      const pickupDate = new Date(order.pickupDateTime);
-      pickupDate.setHours(0, 0, 0, 0);
-      return pickupDate.getTime() === today.getTime();
-    });
-
-    const currentAssignment = allOrders.find(order => {
-      const assignment = order.assignments.find(a => 
-        a.driverId.toString() === driver._id.toString()
-      );
-      return assignment && (assignment.status === 'assigned' || assignment.status === 'in_transit');
-    });
 
     res.json({
-      todayRides: todayRides.length,
-      totalRides: driver.stats.totalRides,
-      completedRides: driver.stats.completedRides,
-      currentAssignment: currentAssignment || null,
-      recentOrders: allOrders.slice(0, 5),
+      stats: driver.stats,
+      activeOrders,
       profileStatus: {
         hasProfilePhoto: !!driver.profilePhoto,
         isApproved: driver.isApproved,
-        isActive: driver.isActive
+        isActive: driver.isActive,
+        profilePhoto: driver.profilePhoto ? `/uploads/${driver.profilePhoto}` : null
       }
     });
   } catch (err) {
+    console.error('Dashboard error:', err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// APPROVE DRIVER (Admin)
+app.put('/admin/drivers/:driverId/approve', authMiddleware, async (req, res) => {
+  try {
+    if (req.userRole !== 'admin') {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    const driver = await Driver.findById(req.params.driverId);
+    if (!driver) {
+      return res.status(404).json({ error: "Driver not found" });
+    }
+
+    driver.isApproved = true;
+    await driver.save();
+
+    // Notify driver
+    await new Notification({
+      userId: driver.userId,
+      title: "Account Approved",
+      message: "Your driver account has been approved! You can now activate your status.",
+      type: 'status'
+    }).save();
+
+    res.json({ message: "Driver approved", driver });
+  } catch (err) {
+    console.error('Approve driver error:', err);
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -795,6 +814,7 @@ app.get('/orders', authMiddleware, async (req, res) => {
     const orders = await Order.find(query).sort({ createdAt: -1 });
     res.json(orders);
   } catch (err) {
+    console.error('Get orders error:', err);
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -815,6 +835,7 @@ app.get('/orders/history', authMiddleware, async (req, res) => {
     const orders = await Order.find(query).sort({ completedAt: -1 });
     res.json(orders);
   } catch (err) {
+    console.error('Get order history error:', err);
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -839,6 +860,7 @@ app.get('/orders/:orderId/track', authMiddleware, async (req, res) => {
 
     res.json(order);
   } catch (err) {
+    console.error('Track order error:', err);
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -899,96 +921,188 @@ app.post('/orders/:orderId/assign', authMiddleware, async (req, res) => {
 
     res.json({ message: "Drivers assigned successfully", order });
   } catch (err) {
+    console.error('Assign drivers error:', err);
     res.status(500).json({ error: "Server error" });
   }
 });
 
-// UPLOAD VEHICLE IMAGES (Driver) - Minimum 10 images required
-app.post('/orders/:orderId/upload-images', authMiddleware, upload.array('images', 50), async (req, res) => {
+// UPLOAD VEHICLE IMAGES (Driver)
+app.post('/orders/:orderId/upload-images', authMiddleware, (req, res) => {
+  // Use multer for multiple images
+  upload.array('images', 20)(req, res, async (err) => {
+    try {
+      // Check for multer errors
+      if (err instanceof multer.MulterError) {
+        console.error('Multer error:', err);
+        return res.status(400).json({ error: `Upload error: ${err.message}` });
+      } else if (err) {
+        console.error('Upload error:', err);
+        return res.status(400).json({ error: err.message });
+      }
+
+      if (req.userRole !== 'driver') {
+        return res.status(403).json({ error: "Access denied" });
+      }
+
+      if (!req.files || req.files.length === 0) {
+        return res.status(400).json({ error: "No images uploaded" });
+      }
+
+      if (req.files.length < 10) {
+        // Delete uploaded files
+        req.files.forEach(file => {
+          if (fs.existsSync(file.path)) {
+            fs.unlinkSync(file.path);
+          }
+        });
+        return res.status(400).json({ error: "Minimum 10 images required" });
+      }
+
+      const driver = await Driver.findOne({ userId: req.userId });
+      if (!driver) {
+        return res.status(404).json({ error: "Driver not found" });
+      }
+
+      const order = await Order.findById(req.params.orderId);
+      if (!order) {
+        return res.status(404).json({ error: "Order not found" });
+      }
+
+      // Find driver's assignment
+      const assignment = order.assignments.find(
+        a => a.driverId.toString() === driver._id.toString()
+      );
+
+      if (!assignment) {
+        return res.status(400).json({ error: "You are not assigned to this order" });
+      }
+
+      // Store filenames
+      assignment.vehicleImages = req.files.map(file => file.filename);
+      await order.save();
+
+      res.json({ 
+        message: "Images uploaded successfully",
+        imageCount: req.files.length 
+      });
+    } catch (error) {
+      console.error('Image upload error:', error);
+      // Clean up uploaded files on error
+      if (req.files) {
+        req.files.forEach(file => {
+          if (file.path && fs.existsSync(file.path)) {
+            try {
+              fs.unlinkSync(file.path);
+            } catch (unlinkErr) {
+              console.error('Error deleting file:', unlinkErr);
+            }
+          }
+        });
+      }
+      res.status(500).json({ error: "Server error" });
+    }
+  });
+});
+
+// START RIDE (Driver)
+app.put('/orders/:orderId/start', authMiddleware, async (req, res) => {
   try {
     if (req.userRole !== 'driver') {
-      return res.status(403).json({ error: "Only drivers can upload images" });
+      return res.status(403).json({ error: "Access denied" });
     }
 
-    if (req.files.length < 10) {
-      return res.status(400).json({ error: "Minimum 10 images required" });
+    const driver = await Driver.findOne({ userId: req.userId });
+    if (!driver) {
+      return res.status(404).json({ error: "Driver not found" });
     }
 
-    const { orderId } = req.params;
-    const order = await Order.findById(orderId);
-    
+    const order = await Order.findById(req.params.orderId);
     if (!order) {
       return res.status(404).json({ error: "Order not found" });
     }
 
-    const driver = await Driver.findOne({ userId: req.userId });
-    const assignment = order.assignments.find(a => 
-      a.driverId.toString() === driver._id.toString()
+    // Find driver's assignment
+    const assignment = order.assignments.find(
+      a => a.driverId.toString() === driver._id.toString()
     );
-    
+
     if (!assignment) {
-      return res.status(403).json({ error: "You are not assigned to this order" });
+      return res.status(400).json({ error: "You are not assigned to this order" });
     }
 
-    assignment.vehicleImages = req.files.map(file => file.filename);
+    if (assignment.vehicleImages.length < 10) {
+      return res.status(400).json({ error: "Please upload at least 10 vehicle images first" });
+    }
+
     assignment.status = 'in_transit';
     assignment.startedAt = new Date();
-    
-    // Update order status if all assignments are in transit
-    const allInTransit = order.assignments.every(a => 
-      a.status === 'in_transit' || a.status === 'completed'
-    );
-    if (allInTransit) {
+
+    // Check if all drivers started
+    const allStarted = order.assignments.every(a => a.status === 'in_transit' || a.status === 'completed');
+    if (allStarted) {
       order.status = 'in_transit';
     }
-    
+
     await order.save();
 
-    res.json({ 
-      message: "Images uploaded successfully",
-      imageCount: req.files.length 
-    });
+    // Notify customer
+    const customer = await Customer.findById(order.customerId);
+    if (customer) {
+      await new Notification({
+        userId: customer.userId,
+        title: "Ride Started",
+        message: `${driver.name} has started transporting your vehicle`,
+        type: 'status',
+        orderId: order._id
+      }).save();
+    }
+
+    res.json({ message: "Ride started successfully" });
   } catch (err) {
+    console.error('Start ride error:', err);
     res.status(500).json({ error: "Server error" });
   }
 });
 
 // COMPLETE RIDE (Driver)
-app.post('/orders/:orderId/complete', authMiddleware, async (req, res) => {
+app.put('/orders/:orderId/complete', authMiddleware, async (req, res) => {
   try {
     if (req.userRole !== 'driver') {
-      return res.status(403).json({ error: "Only drivers can complete rides" });
+      return res.status(403).json({ error: "Access denied" });
     }
 
-    const { orderId } = req.params;
-    const order = await Order.findById(orderId);
-    
+    const driver = await Driver.findOne({ userId: req.userId });
+    if (!driver) {
+      return res.status(404).json({ error: "Driver not found" });
+    }
+
+    const order = await Order.findById(req.params.orderId);
     if (!order) {
       return res.status(404).json({ error: "Order not found" });
     }
 
-    const driver = await Driver.findOne({ userId: req.userId });
-    const assignment = order.assignments.find(a => 
-      a.driverId.toString() === driver._id.toString()
+    // Find driver's assignment
+    const assignment = order.assignments.find(
+      a => a.driverId.toString() === driver._id.toString()
     );
-    
+
     if (!assignment) {
-      return res.status(403).json({ error: "You are not assigned to this order" });
+      return res.status(400).json({ error: "You are not assigned to this order" });
     }
 
     if (assignment.status !== 'in_transit') {
-      return res.status(400).json({ error: "Order must be in transit to complete" });
+      return res.status(400).json({ error: "Ride must be started first" });
     }
 
     assignment.status = 'completed';
     assignment.completedAt = new Date();
-    
-    // Check if all assignments are completed
+
+    // Check if all assignments completed
     const allCompleted = order.assignments.every(a => a.status === 'completed');
     if (allCompleted) {
       order.status = 'completed';
       order.completedAt = new Date();
-      
+
       // Update customer stats
       const customer = await Customer.findById(order.customerId);
       if (customer) {
@@ -1020,6 +1134,7 @@ app.post('/orders/:orderId/complete', authMiddleware, async (req, res) => {
       orderCompleted: allCompleted 
     });
   } catch (err) {
+    console.error('Complete ride error:', err);
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -1055,6 +1170,7 @@ app.get('/admin/dashboard', authMiddleware, async (req, res) => {
       drivers
     });
   } catch (err) {
+    console.error('Admin dashboard error:', err);
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -1073,6 +1189,7 @@ app.get('/admin/driver-locations', authMiddleware, async (req, res) => {
 
     res.json(drivers);
   } catch (err) {
+    console.error('Get driver locations error:', err);
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -1155,6 +1272,7 @@ app.get('/admin/drivers', authMiddleware, async (req, res) => {
     const drivers = await Driver.find().populate('userId', 'name email');
     res.json(drivers);
   } catch (error) {
+    console.error('Get drivers error:', error);
     res.status(500).json({ error: 'Failed to fetch drivers' });
   }
 });
@@ -1169,6 +1287,7 @@ app.get('/admin/customers', authMiddleware, async (req, res) => {
     const customers = await Customer.find().populate('userId', 'name email');
     res.json(customers);
   } catch (error) {
+    console.error('Get customers error:', error);
     res.status(500).json({ error: 'Failed to fetch customers' });
   }
 });
@@ -1182,6 +1301,7 @@ app.get('/notifications', authMiddleware, async (req, res) => {
       .limit(20);
     res.json(notifications);
   } catch (err) {
+    console.error('Get notifications error:', err);
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -1191,6 +1311,7 @@ app.put('/notifications/:id/read', authMiddleware, async (req, res) => {
     await Notification.findByIdAndUpdate(req.params.id, { isRead: true });
     res.json({ message: "Notification marked as read" });
   } catch (err) {
+    console.error('Mark notification read error:', err);
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -1250,4 +1371,5 @@ ${message || "No additional message"}
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on port ${PORT}`);
+  console.log(`Uploads directory: ${uploadsDir}`);
 });
