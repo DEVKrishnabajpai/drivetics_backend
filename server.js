@@ -105,13 +105,26 @@ const UserSchema = new mongoose.Schema({
 
 const User = mongoose.model("User", UserSchema);
 
+// ENHANCED DRIVER SCHEMA with approval workflow
 const DriverSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, unique: true },
   name: { type: String, required: true },
   email: { type: String, required: true },
-  profilePhoto: { type: String, default: null },
-  isActive: { type: Boolean, default: false },
-  isApproved: { type: Boolean, default: false },
+  profilePhoto: { type: String, required: true }, // Required during registration
+  
+  // Approval Status: 'pending', 'approved', 'rejected'
+  approvalStatus: { 
+    type: String, 
+    enum: ['pending', 'approved', 'rejected'], 
+    default: 'pending',
+    index: true 
+  },
+  
+  isActive: { type: Boolean, default: false }, // Only matters after approval
+  rejectionReason: { type: String }, // If rejected, admin can provide reason
+  approvedAt: { type: Date },
+  approvedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" }, // Admin who approved
+  
   lastActiveAt: { type: Date, default: Date.now },
   currentLocation: {
     latitude: { type: Number },
@@ -141,7 +154,6 @@ const CustomerSchema = new mongoose.Schema({
 
 const Customer = mongoose.model("Customer", CustomerSchema);
 
-// ENHANCED ORDER SCHEMA with cost field
 const OrderSchema = new mongoose.Schema({
   customerId: { type: mongoose.Schema.Types.ObjectId, ref: "Customer", required: true },
   customerName: { type: String, required: true },
@@ -150,7 +162,7 @@ const OrderSchema = new mongoose.Schema({
   dropLocation: { type: String, required: true },
   pickupDateTime: { type: Date, required: true },
   vehicleCount: { type: Number, required: true },
-  cost: { type: Number, default: null }, // Admin can set this
+  cost: { type: Number, default: null },
   status: { 
     type: String, 
     enum: ['pending', 'assigned', 'in_transit', 'completed', 'cancelled'],
@@ -181,7 +193,7 @@ const NotificationSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
   title: { type: String, required: true },
   message: { type: String, required: true },
-  type: { type: String, enum: ['order', 'assignment', 'status'], required: true },
+  type: { type: String, enum: ['order', 'assignment', 'status', 'approval'], required: true },
   orderId: { type: mongoose.Schema.Types.ObjectId, ref: "Order" },
   isRead: { type: Boolean, default: false },
   createdAt: { type: Date, default: Date.now }
@@ -201,10 +213,8 @@ const CustomerIntent = mongoose.model("customer_intent", CustomerIntentSchema);
 
 // ==================== WEBSOCKET SETUP ====================
 
-// Store connected clients by userId and role
 const connectedClients = new Map();
 
-// WebSocket authentication middleware
 io.use((socket, next) => {
   const token = socket.handshake.auth.token;
   if (!token) {
@@ -222,23 +232,17 @@ io.use((socket, next) => {
 
 io.on('connection', (socket) => {
   console.log(`User connected: ${socket.userId} (${socket.userRole})`);
-  
-  // Store client connection
   connectedClients.set(socket.userId, { socket, role: socket.userRole });
-  
-  // Join role-specific room
   socket.join(socket.userRole);
   
-  // Handle driver status change
   socket.on('driver:status_change', async (data) => {
     try {
       const driver = await Driver.findOne({ userId: socket.userId });
-      if (driver) {
+      if (driver && driver.approvalStatus === 'approved') {
         driver.isActive = data.isActive;
         driver.lastActiveAt = new Date();
         await driver.save();
         
-        // Notify all admins
         io.to('admin').emit('driver:status_updated', {
           driverId: driver._id,
           name: driver.name,
@@ -250,7 +254,6 @@ io.on('connection', (socket) => {
     }
   });
   
-  // Handle driver location update
   socket.on('driver:location_update', async (data) => {
     try {
       const driver = await Driver.findOne({ userId: socket.userId });
@@ -262,7 +265,6 @@ io.on('connection', (socket) => {
         };
         await driver.save();
         
-        // Update location in active orders
         await Order.updateMany(
           { 'assignments.driverId': driver._id, status: 'in_transit' },
           { 
@@ -272,7 +274,6 @@ io.on('connection', (socket) => {
           }
         );
         
-        // Notify admins and customers
         io.to('admin').emit('driver:location_updated', {
           driverId: driver._id,
           location: driver.currentLocation
@@ -289,7 +290,6 @@ io.on('connection', (socket) => {
   });
 });
 
-// Helper function to emit to specific user
 function emitToUser(userId, event, data) {
   const client = connectedClients.get(userId.toString());
   if (client && client.socket) {
@@ -297,7 +297,6 @@ function emitToUser(userId, event, data) {
   }
 }
 
-// Helper function to emit to all admins
 function emitToAdmins(event, data) {
   io.to('admin').emit(event, data);
 }
@@ -321,13 +320,31 @@ async function createUserWithRole(userData) {
     await newUser.save({ session });
 
     if (userData.role === 'driver') {
+      // Driver MUST provide profile photo during registration
+      if (!userData.profilePhoto) {
+        throw new Error('Profile photo is required for driver registration');
+      }
+      
       const driver = new Driver({
         userId: newUser._id,
         name: newUser.name,
         email: newUser.email,
-        profilePhoto: userData.photoUrl || null
+        profilePhoto: userData.profilePhoto,
+        approvalStatus: 'pending' // Starts as pending
       });
       await driver.save({ session });
+      
+      // Notify all admins about new driver request
+      const admins = await User.find({ role: 'admin' });
+      for (let admin of admins) {
+        await new Notification({
+          userId: admin._id,
+          title: "New Driver Registration",
+          message: `${newUser.name} has registered as a driver and is awaiting approval`,
+          type: 'approval'
+        }).save({ session });
+      }
+      
     } else if (userData.role === 'customer') {
       const customer = new Customer({
         userId: newUser._id,
@@ -367,12 +384,84 @@ const authMiddleware = (req, res, next) => {
 
 // ==================== AUTH ROUTES ====================
 
+// ENHANCED DRIVER REGISTRATION WITH PHOTO
+app.post("/register/driver", upload.single('profilePhoto'), async (req, res) => {
+  try {
+    const { name, email, password } = req.body;
+
+    if (!name || !email || !password) {
+      return res.status(400).json({ error: "All fields are required" });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ error: "Profile photo is required for driver registration" });
+    }
+
+    const existingUser = await User.findOne({ email });
+    if (existingUser) {
+      // Delete uploaded file if user exists
+      fs.unlinkSync(req.file.path);
+      return res.status(400).json({ error: "Email already exists" });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    
+    const user = await createUserWithRole({
+      name,
+      email,
+      password: hashedPassword,
+      role: 'driver',
+      profilePhoto: `/uploads/${req.file.filename}`,
+      authProvider: 'local'
+    });
+
+    // Emit real-time notification to admins
+    emitToAdmins('driver:new_request', {
+      driverId: (await Driver.findOne({ userId: user._id}))._id,
+      name: user.name,
+      email: user.email
+    });
+
+    const token = jwt.sign(
+      { userId: user._id, role: user.role },
+      JWT_SECRET,
+      { expiresIn: "7d" }
+    );
+
+    res.status(201).json({
+      message: "Registration successful. Your account is pending approval.",
+      token,
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        role: user.role
+      },
+      requiresApproval: true
+    });
+  } catch (err) {
+    console.error("Driver registration error:", err);
+    // Clean up uploaded file on error
+    if (req.file) {
+      fs.unlinkSync(req.file.path);
+    }
+    res.status(500).json({ error: err.message || "Server error during registration" });
+  }
+});
+
+// REGULAR REGISTRATION (for customers and admins)
 app.post("/register", async (req, res) => {
   try {
     const { name, email, password, role } = req.body;
 
     if (!name || !email || !password || !role) {
       return res.status(400).json({ error: "All fields are required" });
+    }
+
+    if (role === 'driver') {
+      return res.status(400).json({ 
+        error: "Drivers must register using /register/driver endpoint with profile photo" 
+      });
     }
 
     const existingUser = await User.findOne({ email });
@@ -464,6 +553,12 @@ app.post("/google-auth", async (req, res) => {
       return res.status(400).json({ error: "Token and role are required" });
     }
 
+    if (role === 'driver') {
+      return res.status(400).json({ 
+        error: "Drivers cannot register via Google. Please use email registration with profile photo." 
+      });
+    }
+
     const client = googleClients[platform] || googleClients.android;
     const ticket = await client.verifyIdToken({
       idToken,
@@ -520,7 +615,8 @@ app.post("/google-auth", async (req, res) => {
 
 // ==================== DRIVER ROUTES ====================
 
-app.get('/driver/profile', authMiddleware, async (req, res) => {
+// GET DRIVER STATUS (approval status check)
+app.get('/driver/approval-status', authMiddleware, async (req, res) => {
   try {
     if (req.userRole !== 'driver') {
       return res.status(403).json({ error: "Access denied" });
@@ -531,16 +627,19 @@ app.get('/driver/profile', authMiddleware, async (req, res) => {
       return res.status(404).json({ error: "Driver profile not found" });
     }
 
-    res.json(driver);
+    res.json({
+      approvalStatus: driver.approvalStatus,
+      profilePhoto: driver.profilePhoto,
+      rejectionReason: driver.rejectionReason,
+      approvedAt: driver.approvedAt
+    });
   } catch (err) {
-    console.error('Get driver profile error:', err);
+    console.error('Get approval status error:', err);
     res.status(500).json({ error: "Server error" });
   }
 });
-// ==================== DRIVER DASHBOARD ENDPOINTS - ADD THESE TO YOUR SERVER ====================
-// Add these endpoints after line 539 (after app.get('/driver/profile'))
 
-// GET DRIVER DASHBOARD DATA
+// GET DRIVER DASHBOARD (only for approved drivers)
 app.get('/driver/dashboard', authMiddleware, async (req, res) => {
   try {
     if (req.userRole !== 'driver') {
@@ -549,7 +648,17 @@ app.get('/driver/dashboard', authMiddleware, async (req, res) => {
 
     const driver = await Driver.findOne({ userId: req.userId });
     if (!driver) {
-      return res.status(404).json({ error: "Driver not found" });
+      return res.status(404).json({ error: "Driver profile not found" });
+    }
+
+    // Return approval status if not approved
+    if (driver.approvalStatus !== 'approved') {
+      return res.json({
+        approvalStatus: driver.approvalStatus,
+        profilePhoto: driver.profilePhoto,
+        rejectionReason: driver.rejectionReason,
+        requiresApproval: true
+      });
     }
 
     // Get active assignments
@@ -559,12 +668,9 @@ app.get('/driver/dashboard', authMiddleware, async (req, res) => {
     }).sort({ pickupDateTime: 1 });
 
     // Get completed rides count
-    const completedRides = await Order.countDocuments({
-      'assignments.driverId': driver._id,
-      'assignments.status': 'completed'
-    });
+    const completedRides = driver.stats.completedRides;
 
-    // Get total earnings (if cost is tracked)
+    // Get total earnings
     const completedOrders = await Order.find({
       'assignments.driverId': driver._id,
       status: 'completed',
@@ -572,29 +678,25 @@ app.get('/driver/dashboard', authMiddleware, async (req, res) => {
     });
 
     const totalEarnings = completedOrders.reduce((sum, order) => {
-      // Assuming each driver gets an equal share
       const driverCount = order.assignments.length;
       return sum + (order.cost / driverCount);
     }, 0);
 
     res.json({
-      profileStatus: {
-        hasProfilePhoto: driver.profilePhoto ? true : false,
-        isApproved: driver.isApproved,
-        isActive: driver.isActive
-      },
+      approvalStatus: 'approved',
+      requiresApproval: false,
+      profilePhoto: driver.profilePhoto,
+      isActive: driver.isActive,
       stats: {
         activeRides: activeAssignments.length,
-        completedRides: driver.stats.completedRides || completedRides,
+        completedRides: completedRides,
         totalEarnings: Math.round(totalEarnings * 100) / 100
       },
       activeAssignments: activeAssignments,
       driver: {
         name: driver.name,
         email: driver.email,
-        isActive: driver.isActive,
-        isApproved: driver.isApproved,
-        profilePhoto: driver.profilePhoto
+        isActive: driver.isActive
       }
     });
   } catch (err) {
@@ -603,68 +705,7 @@ app.get('/driver/dashboard', authMiddleware, async (req, res) => {
   }
 });
 
-// GET DRIVER PROFILE STATUS (for quick checks)
-app.get('/driver/profile-status', authMiddleware, async (req, res) => {
-  try {
-    if (req.userRole !== 'driver') {
-      return res.status(403).json({ error: "Access denied" });
-    }
-
-    const driver = await Driver.findOne({ userId: req.userId });
-    if (!driver) {
-      return res.status(404).json({ error: "Driver not found" });
-    }
-
-    res.json({
-      hasProfilePhoto: driver.profilePhoto ? true : false,
-      isApproved: driver.isApproved,
-      isActive: driver.isActive
-    });
-  } catch (err) {
-    console.error('Get profile status error:', err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// UPLOAD PROFILE PHOTO
-app.post('/driver/upload-profile', authMiddleware, upload.single('profilePhoto'), async (req, res) => {
-  try {
-    if (req.userRole !== 'driver') {
-      return res.status(403).json({ error: "Access denied" });
-    }
-
-    if (!req.file) {
-      return res.status(400).json({ error: "No file uploaded" });
-    }
-
-    const driver = await Driver.findOne({ userId: req.userId });
-    if (!driver) {
-      return res.status(404).json({ error: "Driver not found" });
-    }
-
-    // Delete old profile photo if exists
-    if (driver.profilePhoto) {
-      const oldPhotoPath = path.join(__dirname, driver.profilePhoto.replace(/^\//, ''));
-      if (fs.existsSync(oldPhotoPath)) {
-        fs.unlinkSync(oldPhotoPath);
-      }
-    }
-
-    // Save new profile photo path
-    driver.profilePhoto = `/uploads/${req.file.filename}`;
-    await driver.save();
-
-    res.json({
-      message: "Profile photo uploaded successfully",
-      profilePhoto: driver.profilePhoto
-    });
-  } catch (err) {
-    console.error('Upload profile photo error:', err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// FIX THE TOGGLE STATUS ENDPOINT - Replace the existing one
+// TOGGLE DRIVER STATUS (only for approved drivers)
 app.put('/driver/toggle-status', authMiddleware, async (req, res) => {
   try {
     if (req.userRole !== 'driver') {
@@ -676,136 +717,12 @@ app.put('/driver/toggle-status', authMiddleware, async (req, res) => {
       return res.status(404).json({ error: "Driver not found" });
     }
 
-    // Check if profile photo is uploaded and driver is approved
-    if (!driver.profilePhoto) {
-      return res.status(400).json({ 
-        error: "Please upload your profile photo first" 
+    // Check approval status
+    if (driver.approvalStatus !== 'approved') {
+      return res.status(403).json({ 
+        error: "Your account is not approved yet. Please wait for admin approval.",
+        approvalStatus: driver.approvalStatus
       });
-    }
-
-    if (!driver.isApproved) {
-      return res.status(400).json({ 
-        error: "Your profile is pending approval" 
-      });
-    }
-
-    driver.isActive = !driver.isActive;
-    driver.lastActiveAt = new Date();
-    await driver.save();
-
-    res.json({ 
-      message: `Status changed to ${driver.isActive ? 'active' : 'inactive'}`,
-      isActive: driver.isActive
-    });
-  } catch (err) {
-    console.error('Toggle status error:', err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// COMPLETE RIDE WITH IMAGES
-app.post('/driver/complete-ride/:orderId', authMiddleware, upload.array('vehicleImages', 5), async (req, res) => {
-  try {
-    if (req.userRole !== 'driver') {
-      return res.status(403).json({ error: "Access denied" });
-    }
-
-    const driver = await Driver.findOne({ userId: req.userId });
-    const order = await Order.findById(req.params.orderId);
-
-    if (!order) {
-      return res.status(404).json({ error: "Order not found" });
-    }
-
-    const assignment = order.assignments.find(
-      a => a.driverId.toString() === driver._id.toString()
-    );
-
-    if (!assignment) {
-      return res.status(404).json({ error: "Assignment not found" });
-    }
-
-    assignment.status = 'completed';
-    assignment.completedAt = new Date();
-    
-    if (req.files && req.files.length > 0) {
-      assignment.vehicleImages = req.files.map(f => `/uploads/${f.filename}`);
-    }
-
-    const allCompleted = order.assignments.every(a => a.status === 'completed');
-    if (allCompleted) {
-      order.status = 'completed';
-      order.completedAt = new Date();
-      
-      driver.stats.completedRides += 1;
-      await driver.save();
-
-      const customer = await Customer.findById(order.customerId);
-      if (customer) {
-        customer.stats.completedOrders += 1;
-        await customer.save();
-      }
-    }
-
-    await order.save();
-
-    res.json({ 
-      message: "Ride completed successfully",
-      orderCompleted: allCompleted 
-    });
-  } catch (err) {
-    console.error('Complete ride error:', err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// UPLOAD ORDER IMAGES (separate endpoint for uploading images)
-app.post('/orders/:orderId/upload-images', authMiddleware, upload.array('images', 20), async (req, res) => {
-  try {
-    if (req.userRole !== 'driver') {
-      return res.status(403).json({ error: "Access denied" });
-    }
-
-    const driver = await Driver.findOne({ userId: req.userId });
-    const order = await Order.findById(req.params.orderId);
-
-    if (!order) {
-      return res.status(404).json({ error: "Order not found" });
-    }
-
-    const assignment = order.assignments.find(
-      a => a.driverId.toString() === driver._id.toString()
-    );
-
-    if (!assignment) {
-      return res.status(404).json({ error: "Assignment not found" });
-    }
-
-    if (req.files && req.files.length > 0) {
-      assignment.vehicleImages = req.files.map(f => `/uploads/${f.filename}`);
-      await order.save();
-      
-      res.json({ 
-        message: "Images uploaded successfully",
-        imageCount: req.files.length
-      });
-    } else {
-      res.status(400).json({ error: "No images uploaded" });
-    }
-  } catch (err) {
-    console.error('Upload images error:', err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-app.post('/driver/toggle-status', authMiddleware, async (req, res) => {
-  try {
-    if (req.userRole !== 'driver') {
-      return res.status(403).json({ error: "Access denied" });
-    }
-
-    const driver = await Driver.findOne({ userId: req.userId });
-    if (!driver) {
-      return res.status(404).json({ error: "Driver not found" });
     }
 
     driver.isActive = !driver.isActive;
@@ -826,6 +743,49 @@ app.post('/driver/toggle-status', authMiddleware, async (req, res) => {
     });
   } catch (err) {
     console.error('Toggle status error:', err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// UPDATE PROFILE PHOTO (for approved drivers only)
+app.post('/driver/update-photo', authMiddleware, upload.single('profilePhoto'), async (req, res) => {
+  try {
+    if (req.userRole !== 'driver') {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded" });
+    }
+
+    const driver = await Driver.findOne({ userId: req.userId });
+    if (!driver) {
+      return res.status(404).json({ error: "Driver not found" });
+    }
+
+    // Only approved drivers can update photo
+    if (driver.approvalStatus !== 'approved') {
+      fs.unlinkSync(req.file.path);
+      return res.status(403).json({ error: "Only approved drivers can update profile photo" });
+    }
+
+    // Delete old profile photo
+    if (driver.profilePhoto && fs.existsSync(path.join(__dirname, driver.profilePhoto))) {
+      fs.unlinkSync(path.join(__dirname, driver.profilePhoto));
+    }
+
+    driver.profilePhoto = `/uploads/${req.file.filename}`;
+    await driver.save();
+
+    res.json({
+      message: "Profile photo updated successfully",
+      profilePhoto: driver.profilePhoto
+    });
+  } catch (err) {
+    console.error('Update profile photo error:', err);
+    if (req.file) {
+      fs.unlinkSync(req.file.path);
+    }
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -853,7 +813,6 @@ app.post('/driver/update-location', authMiddleware, async (req, res) => {
     };
     await driver.save();
 
-    // Update location in active assignments
     await Order.updateMany(
       { 'assignments.driverId': driver._id, status: { $in: ['assigned', 'in_transit'] } },
       { 
@@ -863,7 +822,6 @@ app.post('/driver/update-location', authMiddleware, async (req, res) => {
       }
     );
 
-    // Emit location update to admins
     emitToAdmins('driver:location_updated', {
       driverId: driver._id,
       name: driver.name,
@@ -888,6 +846,10 @@ app.get('/driver/assignments', authMiddleware, async (req, res) => {
       return res.status(404).json({ error: "Driver not found" });
     }
 
+    if (driver.approvalStatus !== 'approved') {
+      return res.status(403).json({ error: "Only approved drivers can view assignments" });
+    }
+
     const orders = await Order.find({
       'assignments.driverId': driver._id,
       status: { $in: ['assigned', 'in_transit'] }
@@ -907,6 +869,11 @@ app.post('/driver/start-ride/:orderId', authMiddleware, async (req, res) => {
     }
 
     const driver = await Driver.findOne({ userId: req.userId });
+    
+    if (driver.approvalStatus !== 'approved') {
+      return res.status(403).json({ error: "Only approved drivers can start rides" });
+    }
+
     const order = await Order.findById(req.params.orderId);
 
     if (!order) {
@@ -927,7 +894,6 @@ app.post('/driver/start-ride/:orderId', authMiddleware, async (req, res) => {
 
     await order.save();
 
-    // Notify customer and admin
     const customer = await Customer.findById(order.customerId);
     if (customer) {
       await new Notification({
@@ -965,6 +931,11 @@ app.post('/driver/complete-ride/:orderId', authMiddleware, upload.array('vehicle
     }
 
     const driver = await Driver.findOne({ userId: req.userId });
+    
+    if (driver.approvalStatus !== 'approved') {
+      return res.status(403).json({ error: "Only approved drivers can complete rides" });
+    }
+
     const order = await Order.findById(req.params.orderId);
 
     if (!order) {
@@ -1003,7 +974,6 @@ app.post('/driver/complete-ride/:orderId', authMiddleware, upload.array('vehicle
 
     await order.save();
 
-    // Notify customer
     const customer = await Customer.findById(order.customerId);
     if (customer) {
       await new Notification({
@@ -1036,6 +1006,408 @@ app.post('/driver/complete-ride/:orderId', authMiddleware, upload.array('vehicle
     });
   } catch (err) {
     console.error('Complete ride error:', err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.post('/orders/:orderId/upload-images', authMiddleware, upload.array('images', 20), async (req, res) => {
+  try {
+    if (req.userRole !== 'driver') {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    const driver = await Driver.findOne({ userId: req.userId });
+    const order = await Order.findById(req.params.orderId);
+
+    if (!order) {
+      return res.status(404).json({ error: "Order not found" });
+    }
+
+    const assignment = order.assignments.find(
+      a => a.driverId.toString() === driver._id.toString()
+    );
+
+    if (!assignment) {
+      return res.status(404).json({ error: "Assignment not found" });
+    }
+
+    if (req.files && req.files.length > 0) {
+      assignment.vehicleImages = req.files.map(f => `/uploads/${f.filename}`);
+      await order.save();
+      
+      res.json({ 
+        message: "Images uploaded successfully",
+        imageCount: req.files.length
+      });
+    } else {
+      res.status(400).json({ error: "No images uploaded" });
+    }
+  } catch (err) {
+    console.error('Upload images error:', err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// ==================== ADMIN ROUTES ====================
+
+// GET DRIVER REQUESTS (pending approvals)
+app.get('/admin/driver-requests', authMiddleware, async (req, res) => {
+  try {
+    if (req.userRole !== 'admin') {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    const pendingDrivers = await Driver.find({ 
+      approvalStatus: 'pending' 
+    }).sort({ createdAt: -1 });
+
+    res.json(pendingDrivers);
+  } catch (err) {
+    console.error('Get driver requests error:', err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// APPROVE DRIVER
+app.put('/admin/approve-driver/:driverId', authMiddleware, async (req, res) => {
+  try {
+    if (req.userRole !== 'admin') {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    const driver = await Driver.findById(req.params.driverId);
+    if (!driver) {
+      return res.status(404).json({ error: "Driver not found" });
+    }
+
+    driver.approvalStatus = 'approved';
+    driver.approvedAt = new Date();
+    driver.approvedBy = req.userId;
+    await driver.save();
+
+    // Notify driver
+    await new Notification({
+      userId: driver.userId,
+      title: "Account Approved!",
+      message: "Your driver account has been approved. You can now start accepting rides!",
+      type: 'approval'
+    }).save();
+
+    emitToUser(driver.userId, 'driver:approved', {
+      message: 'Your account has been approved!'
+    });
+
+    emitToAdmins('driver:request_processed', {
+      driverId: driver._id,
+      status: 'approved'
+    });
+
+    res.json({ 
+      message: "Driver approved successfully",
+      driver 
+    });
+  } catch (err) {
+    console.error('Approve driver error:', err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// REJECT DRIVER
+app.put('/admin/reject-driver/:driverId', authMiddleware, async (req, res) => {
+  try {
+    if (req.userRole !== 'admin') {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    const { reason } = req.body;
+    
+    const driver = await Driver.findById(req.params.driverId);
+    if (!driver) {
+      return res.status(404).json({ error: "Driver not found" });
+    }
+
+    driver.approvalStatus = 'rejected';
+    driver.rejectionReason = reason || 'Your application did not meet our requirements.';
+    await driver.save();
+
+    // Notify driver
+    await new Notification({
+      userId: driver.userId,
+      title: "Application Rejected",
+      message: driver.rejectionReason,
+      type: 'approval'
+    }).save();
+
+    emitToUser(driver.userId, 'driver:rejected', {
+      message: 'Your application has been rejected',
+      reason: driver.rejectionReason
+    });
+
+    emitToAdmins('driver:request_processed', {
+      driverId: driver._id,
+      status: 'rejected'
+    });
+
+    res.json({ 
+      message: "Driver rejected",
+      driver 
+    });
+  } catch (err) {
+    console.error('Reject driver error:', err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get('/admin/dashboard', authMiddleware, async (req, res) => {
+  try {
+    if (req.userRole !== 'admin') {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    const totalDrivers = await Driver.countDocuments({ approvalStatus: 'approved' });
+    const activeDrivers = await Driver.countDocuments({ approvalStatus: 'approved', isActive: true });
+    const pendingDrivers = await Driver.countDocuments({ approvalStatus: 'pending' });
+    const totalCustomers = await Customer.countDocuments();
+    
+    const pendingOrders = await Order.countDocuments({ status: 'pending' });
+    const assignedOrders = await Order.countDocuments({ status: 'assigned' });
+    const inTransitOrders = await Order.countDocuments({ status: 'in_transit' });
+    const completedOrders = await Order.countDocuments({ status: 'completed' });
+
+    const recentOrders = await Order.find().sort({ createdAt: -1 }).limit(10);
+    const drivers = await Driver.find({ approvalStatus: 'approved' });
+
+    res.json({
+      totalDrivers,
+      activeDrivers,
+      pendingDrivers,
+      totalCustomers,
+      pendingOrders,
+      assignedOrders,
+      inTransitOrders,
+      completedOrders,
+      recentOrders,
+      drivers
+    });
+  } catch (err) {
+    console.error('Admin dashboard error:', err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get('/admin/orders', authMiddleware, async (req, res) => {
+  try {
+    if (req.userRole !== 'admin') {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    const { status, sortBy = 'newest' } = req.query;
+    
+    let query = {};
+    if (status && status !== 'all') {
+      query.status = status;
+    }
+
+    let sortOptions = {};
+    switch (sortBy) {
+      case 'newest':
+        sortOptions = { createdAt: -1 };
+        break;
+      case 'oldest':
+        sortOptions = { createdAt: 1 };
+        break;
+      case 'nearest':
+        sortOptions = { pickupDateTime: 1 };
+        break;
+      case 'farthest':
+        sortOptions = { pickupDateTime: -1 };
+        break;
+      default:
+        sortOptions = { createdAt: -1 };
+    }
+
+    const orders = await Order.find(query).sort(sortOptions);
+    res.json(orders);
+  } catch (err) {
+    console.error('Get orders error:', err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get('/admin/orders/:id', authMiddleware, async (req, res) => {
+  try {
+    if (req.userRole !== 'admin') {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    const order = await Order.findById(req.params.id)
+      .populate('customerId', 'name email phone')
+      .populate('assignments.driverId', 'name email');
+
+    if (!order) {
+      return res.status(404).json({ error: "Order not found" });
+    }
+
+    res.json(order);
+  } catch (err) {
+    console.error('Get order details error:', err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.put('/admin/orders/:id/cost', authMiddleware, async (req, res) => {
+  try {
+    if (req.userRole !== 'admin') {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    const { cost } = req.body;
+    if (!cost || cost <= 0) {
+      return res.status(400).json({ error: "Valid cost required" });
+    }
+
+    const order = await Order.findByIdAndUpdate(
+      req.params.id,
+      { cost: parseFloat(cost) },
+      { new: true }
+    );
+
+    if (!order) {
+      return res.status(404).json({ error: "Order not found" });
+    }
+
+    const customer = await Customer.findById(order.customerId);
+    if (customer) {
+      await new Notification({
+        userId: customer.userId,
+        title: "Order Cost Updated",
+        message: `The cost for your order has been set to $${cost}`,
+        type: 'order',
+        orderId: order._id
+      }).save();
+
+      emitToUser(customer.userId, 'order:cost_updated', {
+        orderId: order._id,
+        cost: cost
+      });
+    }
+
+    emitToAdmins('order:cost_updated', {
+      orderId: order._id,
+      cost: cost
+    });
+
+    res.json({ 
+      message: "Cost updated successfully",
+      order 
+    });
+  } catch (err) {
+    console.error('Update cost error:', err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.post('/orders/:id/assign', authMiddleware, async (req, res) => {
+  try {
+    if (req.userRole !== 'admin') {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    const order = await Order.findById(req.params.id);
+    if (!order) {
+      return res.status(404).json({ error: "Order not found" });
+    }
+
+    if (order.status !== 'pending') {
+      return res.status(400).json({ error: "Order already assigned" });
+    }
+
+    // Only find APPROVED and ACTIVE drivers
+    const activeDrivers = await Driver.find({ 
+      approvalStatus: 'approved',
+      isActive: true
+    }).limit(order.vehicleCount);
+
+    if (activeDrivers.length < order.vehicleCount) {
+      return res.status(400).json({ 
+        error: `Not enough active approved drivers. Need ${order.vehicleCount}, found ${activeDrivers.length}` 
+      });
+    }
+
+    order.assignments = activeDrivers.map(driver => ({
+      driverId: driver._id,
+      driverName: driver.name,
+      status: 'assigned',
+      assignedAt: new Date()
+    }));
+
+    order.status = 'assigned';
+    await order.save();
+
+    for (let driver of activeDrivers) {
+      await new Notification({
+        userId: driver.userId,
+        title: "New Assignment",
+        message: `You've been assigned to a delivery`,
+        type: 'assignment',
+        orderId: order._id
+      }).save();
+
+      driver.stats.totalRides += 1;
+      await driver.save();
+
+      emitToUser(driver.userId, 'assignment:new', {
+        orderId: order._id,
+        order: order
+      });
+    }
+
+    const customer = await Customer.findById(order.customerId);
+    if (customer) {
+      await new Notification({
+        userId: customer.userId,
+        title: "Drivers Assigned",
+        message: `Drivers have been assigned to your order`,
+        type: 'status',
+        orderId: order._id
+      }).save();
+
+      emitToUser(customer.userId, 'order:status_updated', {
+        orderId: order._id,
+        status: 'assigned'
+      });
+    }
+
+    emitToAdmins('order:assigned', {
+      orderId: order._id,
+      driversAssigned: activeDrivers.length
+    });
+
+    res.json({ 
+      message: "Drivers assigned successfully",
+      order 
+    });
+  } catch (err) {
+    console.error('Assign drivers error:', err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get('/admin/driver-locations', authMiddleware, async (req, res) => {
+  try {
+    if (req.userRole !== 'admin') {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    const drivers = await Driver.find({ 
+      approvalStatus: 'approved',
+      isActive: true,
+      'currentLocation.latitude': { $exists: true }
+    }).select('name email currentLocation isActive');
+
+    res.json(drivers);
+  } catch (err) {
+    console.error('Get driver locations error:', err);
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -1075,7 +1447,6 @@ app.post('/orders', authMiddleware, async (req, res) => {
     customer.stats.totalOrders += 1;
     await customer.save();
 
-    // Notify all admins
     const admins = await User.find({ role: 'admin' });
     for (let admin of admins) {
       await new Notification({
@@ -1087,7 +1458,6 @@ app.post('/orders', authMiddleware, async (req, res) => {
       }).save();
     }
 
-    // Emit real-time notification to admins
     emitToAdmins('order:new', {
       order: newOrder
     });
@@ -1137,268 +1507,7 @@ app.get('/orders/:id', authMiddleware, async (req, res) => {
   }
 });
 
-// ==================== ADMIN ROUTES ====================
-
-app.get('/admin/dashboard', authMiddleware, async (req, res) => {
-  try {
-    if (req.userRole !== 'admin') {
-      return res.status(403).json({ error: "Access denied" });
-    }
-
-    const totalDrivers = await Driver.countDocuments();
-    const activeDrivers = await Driver.countDocuments({ isActive: true, isApproved: true });
-    const totalCustomers = await Customer.countDocuments();
-    
-    const pendingOrders = await Order.countDocuments({ status: 'pending' });
-    const assignedOrders = await Order.countDocuments({ status: 'assigned' });
-    const inTransitOrders = await Order.countDocuments({ status: 'in_transit' });
-    const completedOrders = await Order.countDocuments({ status: 'completed' });
-
-    const recentOrders = await Order.find().sort({ createdAt: -1 }).limit(10);
-    const drivers = await Driver.find();
-
-    res.json({
-      totalDrivers,
-      activeDrivers,
-      totalCustomers,
-      pendingOrders,
-      assignedOrders,
-      inTransitOrders,
-      completedOrders,
-      recentOrders,
-      drivers
-    });
-  } catch (err) {
-    console.error('Admin dashboard error:', err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// Get orders with filtering and sorting
-app.get('/admin/orders', authMiddleware, async (req, res) => {
-  try {
-    if (req.userRole !== 'admin') {
-      return res.status(403).json({ error: "Access denied" });
-    }
-
-    const { status, sortBy = 'newest' } = req.query;
-    
-    let query = {};
-    if (status && status !== 'all') {
-      query.status = status;
-    }
-
-    let sortOptions = {};
-    switch (sortBy) {
-      case 'newest':
-        sortOptions = { createdAt: -1 };
-        break;
-      case 'oldest':
-        sortOptions = { createdAt: 1 };
-        break;
-      case 'nearest':
-        sortOptions = { pickupDateTime: 1 };
-        break;
-      case 'farthest':
-        sortOptions = { pickupDateTime: -1 };
-        break;
-      default:
-        sortOptions = { createdAt: -1 };
-    }
-
-    const orders = await Order.find(query).sort(sortOptions);
-    res.json(orders);
-  } catch (err) {
-    console.error('Get orders error:', err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// Get single order details
-app.get('/admin/orders/:id', authMiddleware, async (req, res) => {
-  try {
-    if (req.userRole !== 'admin') {
-      return res.status(403).json({ error: "Access denied" });
-    }
-
-    const order = await Order.findById(req.params.id)
-      .populate('customerId', 'name email phone')
-      .populate('assignments.driverId', 'name email');
-
-    if (!order) {
-      return res.status(404).json({ error: "Order not found" });
-    }
-
-    res.json(order);
-  } catch (err) {
-    console.error('Get order details error:', err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// Set order cost (admin only)
-app.put('/admin/orders/:id/cost', authMiddleware, async (req, res) => {
-  try {
-    if (req.userRole !== 'admin') {
-      return res.status(403).json({ error: "Access denied" });
-    }
-
-    const { cost } = req.body;
-    if (!cost || cost <= 0) {
-      return res.status(400).json({ error: "Valid cost required" });
-    }
-
-    const order = await Order.findByIdAndUpdate(
-      req.params.id,
-      { cost: parseFloat(cost) },
-      { new: true }
-    );
-
-    if (!order) {
-      return res.status(404).json({ error: "Order not found" });
-    }
-
-    // Notify customer
-    const customer = await Customer.findById(order.customerId);
-    if (customer) {
-      await new Notification({
-        userId: customer.userId,
-        title: "Order Cost Updated",
-        message: `The cost for your order has been set to $${cost}`,
-        type: 'order',
-        orderId: order._id
-      }).save();
-
-      emitToUser(customer.userId, 'order:cost_updated', {
-        orderId: order._id,
-        cost: cost
-      });
-    }
-
-    // Emit update to other admins
-    emitToAdmins('order:cost_updated', {
-      orderId: order._id,
-      cost: cost
-    });
-
-    res.json({ 
-      message: "Cost updated successfully",
-      order 
-    });
-  } catch (err) {
-    console.error('Update cost error:', err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// Assign drivers to order
-app.post('/orders/:id/assign', authMiddleware, async (req, res) => {
-  try {
-    if (req.userRole !== 'admin') {
-      return res.status(403).json({ error: "Access denied" });
-    }
-
-    const order = await Order.findById(req.params.id);
-    if (!order) {
-      return res.status(404).json({ error: "Order not found" });
-    }
-
-    if (order.status !== 'pending') {
-      return res.status(400).json({ error: "Order already assigned" });
-    }
-
-    const activeDrivers = await Driver.find({ 
-      isActive: true, 
-      isApproved: true 
-    }).limit(order.vehicleCount);
-
-    if (activeDrivers.length < order.vehicleCount) {
-      return res.status(400).json({ 
-        error: `Not enough active drivers. Need ${order.vehicleCount}, found ${activeDrivers.length}` 
-      });
-    }
-
-    order.assignments = activeDrivers.map(driver => ({
-      driverId: driver._id,
-      driverName: driver.name,
-      status: 'assigned',
-      assignedAt: new Date()
-    }));
-
-    order.status = 'assigned';
-    await order.save();
-
-    // Notify each driver
-    for (let driver of activeDrivers) {
-      await new Notification({
-        userId: driver.userId,
-        title: "New Assignment",
-        message: `You've been assigned to a delivery`,
-        type: 'assignment',
-        orderId: order._id
-      }).save();
-
-      driver.stats.totalRides += 1;
-      await driver.save();
-
-      emitToUser(driver.userId, 'assignment:new', {
-        orderId: order._id,
-        order: order
-      });
-    }
-
-    // Notify customer
-    const customer = await Customer.findById(order.customerId);
-    if (customer) {
-      await new Notification({
-        userId: customer.userId,
-        title: "Drivers Assigned",
-        message: `Drivers have been assigned to your order`,
-        type: 'status',
-        orderId: order._id
-      }).save();
-
-      emitToUser(customer.userId, 'order:status_updated', {
-        orderId: order._id,
-        status: 'assigned'
-      });
-    }
-
-    // Emit to all admins
-    emitToAdmins('order:assigned', {
-      orderId: order._id,
-      driversAssigned: activeDrivers.length
-    });
-
-    res.json({ 
-      message: "Drivers assigned successfully",
-      order 
-    });
-  } catch (err) {
-    console.error('Assign drivers error:', err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-app.get('/admin/driver-locations', authMiddleware, async (req, res) => {
-  try {
-    if (req.userRole !== 'admin') {
-      return res.status(403).json({ error: "Access denied" });
-    }
-
-    const drivers = await Driver.find({ 
-      isActive: true,
-      'currentLocation.latitude': { $exists: true }
-    }).select('name email currentLocation isActive');
-
-    res.json(drivers);
-  } catch (err) {
-    console.error('Get driver locations error:', err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// ==================== USER PROFILE ROUTES ====================
+// ==================== PROFILE & NOTIFICATIONS ====================
 
 app.get('/profile', authMiddleware, async (req, res) => {
   try {
@@ -1469,7 +1578,7 @@ app.get('/admin/drivers', authMiddleware, async (req, res) => {
       return res.status(403).json({ error: 'Not authorized' });
     }
 
-    const drivers = await Driver.find().populate('userId', 'name email');
+    const drivers = await Driver.find({ approvalStatus: 'approved' }).populate('userId', 'name email');
     res.json(drivers);
   } catch (error) {
     console.error('Get drivers error:', error);
@@ -1490,8 +1599,6 @@ app.get('/admin/customers', authMiddleware, async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch customers' });
   }
 });
-
-// ==================== NOTIFICATIONS ====================
 
 app.get('/notifications', authMiddleware, async (req, res) => {
   try {
@@ -1514,8 +1621,6 @@ app.put('/notifications/:id/read', authMiddleware, async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 });
-
-// ==================== CUSTOMER INTENT ====================
 
 app.post("/customer-intent", async (req, res) => {
   try {
