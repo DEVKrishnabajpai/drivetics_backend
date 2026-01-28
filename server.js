@@ -562,7 +562,7 @@ app.post("/google-auth", async (req, res) => {
     const client = googleClients[platform] || googleClients.android;
     const ticket = await client.verifyIdToken({
       idToken,
-      audience: GOOGLE_CLIENT_IDS[platform]
+      audience: GOOGLE_CLIENT_IDS.web
     });
 
     const payload = ticket.getPayload();
