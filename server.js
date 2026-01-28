@@ -537,7 +537,266 @@ app.get('/driver/profile', authMiddleware, async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 });
+// ==================== DRIVER DASHBOARD ENDPOINTS - ADD THESE TO YOUR SERVER ====================
+// Add these endpoints after line 539 (after app.get('/driver/profile'))
 
+// GET DRIVER DASHBOARD DATA
+app.get('/driver/dashboard', authMiddleware, async (req, res) => {
+  try {
+    if (req.userRole !== 'driver') {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    const driver = await Driver.findOne({ userId: req.userId });
+    if (!driver) {
+      return res.status(404).json({ error: "Driver not found" });
+    }
+
+    // Get active assignments
+    const activeAssignments = await Order.find({
+      'assignments.driverId': driver._id,
+      status: { $in: ['assigned', 'in_transit'] }
+    }).sort({ pickupDateTime: 1 });
+
+    // Get completed rides count
+    const completedRides = await Order.countDocuments({
+      'assignments.driverId': driver._id,
+      'assignments.status': 'completed'
+    });
+
+    // Get total earnings (if cost is tracked)
+    const completedOrders = await Order.find({
+      'assignments.driverId': driver._id,
+      status: 'completed',
+      cost: { $exists: true, $ne: null }
+    });
+
+    const totalEarnings = completedOrders.reduce((sum, order) => {
+      // Assuming each driver gets an equal share
+      const driverCount = order.assignments.length;
+      return sum + (order.cost / driverCount);
+    }, 0);
+
+    res.json({
+      profileStatus: {
+        hasProfilePhoto: driver.profilePhoto ? true : false,
+        isApproved: driver.isApproved,
+        isActive: driver.isActive
+      },
+      stats: {
+        activeRides: activeAssignments.length,
+        completedRides: driver.stats.completedRides || completedRides,
+        totalEarnings: Math.round(totalEarnings * 100) / 100
+      },
+      activeAssignments: activeAssignments,
+      driver: {
+        name: driver.name,
+        email: driver.email,
+        isActive: driver.isActive,
+        isApproved: driver.isApproved,
+        profilePhoto: driver.profilePhoto
+      }
+    });
+  } catch (err) {
+    console.error('Driver dashboard error:', err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// GET DRIVER PROFILE STATUS (for quick checks)
+app.get('/driver/profile-status', authMiddleware, async (req, res) => {
+  try {
+    if (req.userRole !== 'driver') {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    const driver = await Driver.findOne({ userId: req.userId });
+    if (!driver) {
+      return res.status(404).json({ error: "Driver not found" });
+    }
+
+    res.json({
+      hasProfilePhoto: driver.profilePhoto ? true : false,
+      isApproved: driver.isApproved,
+      isActive: driver.isActive
+    });
+  } catch (err) {
+    console.error('Get profile status error:', err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// UPLOAD PROFILE PHOTO
+app.post('/driver/upload-profile', authMiddleware, upload.single('profilePhoto'), async (req, res) => {
+  try {
+    if (req.userRole !== 'driver') {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded" });
+    }
+
+    const driver = await Driver.findOne({ userId: req.userId });
+    if (!driver) {
+      return res.status(404).json({ error: "Driver not found" });
+    }
+
+    // Delete old profile photo if exists
+    if (driver.profilePhoto) {
+      const oldPhotoPath = path.join(__dirname, driver.profilePhoto.replace(/^\//, ''));
+      if (fs.existsSync(oldPhotoPath)) {
+        fs.unlinkSync(oldPhotoPath);
+      }
+    }
+
+    // Save new profile photo path
+    driver.profilePhoto = `/uploads/${req.file.filename}`;
+    await driver.save();
+
+    res.json({
+      message: "Profile photo uploaded successfully",
+      profilePhoto: driver.profilePhoto
+    });
+  } catch (err) {
+    console.error('Upload profile photo error:', err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// FIX THE TOGGLE STATUS ENDPOINT - Replace the existing one
+app.put('/driver/toggle-status', authMiddleware, async (req, res) => {
+  try {
+    if (req.userRole !== 'driver') {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    const driver = await Driver.findOne({ userId: req.userId });
+    if (!driver) {
+      return res.status(404).json({ error: "Driver not found" });
+    }
+
+    // Check if profile photo is uploaded and driver is approved
+    if (!driver.profilePhoto) {
+      return res.status(400).json({ 
+        error: "Please upload your profile photo first" 
+      });
+    }
+
+    if (!driver.isApproved) {
+      return res.status(400).json({ 
+        error: "Your profile is pending approval" 
+      });
+    }
+
+    driver.isActive = !driver.isActive;
+    driver.lastActiveAt = new Date();
+    await driver.save();
+
+    res.json({ 
+      message: `Status changed to ${driver.isActive ? 'active' : 'inactive'}`,
+      isActive: driver.isActive
+    });
+  } catch (err) {
+    console.error('Toggle status error:', err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// COMPLETE RIDE WITH IMAGES
+app.post('/driver/complete-ride/:orderId', authMiddleware, upload.array('vehicleImages', 5), async (req, res) => {
+  try {
+    if (req.userRole !== 'driver') {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    const driver = await Driver.findOne({ userId: req.userId });
+    const order = await Order.findById(req.params.orderId);
+
+    if (!order) {
+      return res.status(404).json({ error: "Order not found" });
+    }
+
+    const assignment = order.assignments.find(
+      a => a.driverId.toString() === driver._id.toString()
+    );
+
+    if (!assignment) {
+      return res.status(404).json({ error: "Assignment not found" });
+    }
+
+    assignment.status = 'completed';
+    assignment.completedAt = new Date();
+    
+    if (req.files && req.files.length > 0) {
+      assignment.vehicleImages = req.files.map(f => `/uploads/${f.filename}`);
+    }
+
+    const allCompleted = order.assignments.every(a => a.status === 'completed');
+    if (allCompleted) {
+      order.status = 'completed';
+      order.completedAt = new Date();
+      
+      driver.stats.completedRides += 1;
+      await driver.save();
+
+      const customer = await Customer.findById(order.customerId);
+      if (customer) {
+        customer.stats.completedOrders += 1;
+        await customer.save();
+      }
+    }
+
+    await order.save();
+
+    res.json({ 
+      message: "Ride completed successfully",
+      orderCompleted: allCompleted 
+    });
+  } catch (err) {
+    console.error('Complete ride error:', err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// UPLOAD ORDER IMAGES (separate endpoint for uploading images)
+app.post('/orders/:orderId/upload-images', authMiddleware, upload.array('images', 20), async (req, res) => {
+  try {
+    if (req.userRole !== 'driver') {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    const driver = await Driver.findOne({ userId: req.userId });
+    const order = await Order.findById(req.params.orderId);
+
+    if (!order) {
+      return res.status(404).json({ error: "Order not found" });
+    }
+
+    const assignment = order.assignments.find(
+      a => a.driverId.toString() === driver._id.toString()
+    );
+
+    if (!assignment) {
+      return res.status(404).json({ error: "Assignment not found" });
+    }
+
+    if (req.files && req.files.length > 0) {
+      assignment.vehicleImages = req.files.map(f => `/uploads/${f.filename}`);
+      await order.save();
+      
+      res.json({ 
+        message: "Images uploaded successfully",
+        imageCount: req.files.length
+      });
+    } else {
+      res.status(400).json({ error: "No images uploaded" });
+    }
+  } catch (err) {
+    console.error('Upload images error:', err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
 app.post('/driver/toggle-status', authMiddleware, async (req, res) => {
   try {
     if (req.userRole !== 'driver') {
