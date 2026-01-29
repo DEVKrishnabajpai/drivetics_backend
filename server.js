@@ -98,7 +98,6 @@ const UserSchema = new mongoose.Schema({
   password: { type: String },
   role: { type: String, enum: ['admin', 'customer', 'driver'], required: true, index: true },
   googleId: { type: String, unique: true, sparse: true, index: true },
-  photoUrl: { type: String },
   authProvider: { type: String, enum: ['local', 'google'], default: 'local' },
   createdAt: { type: Date, default: Date.now }
 });
@@ -317,7 +316,7 @@ function authMiddleware(req, res, next) {
 // ==================== HELPER FUNCTIONS ====================
 
 async function createUserWithRole(userData) {
-  const { name, email, password, role, googleId, photoUrl, authProvider, profilePhoto } = userData;
+  const { name, email, password, role, googleId, authProvider, profilePhoto } = userData;
   
   // Create user account
   const user = new User({
@@ -326,7 +325,6 @@ async function createUserWithRole(userData) {
     password,
     role,
     googleId,
-    photoUrl,
     authProvider: authProvider || 'local'
   });
   
@@ -344,8 +342,10 @@ async function createUserWithRole(userData) {
       userId: user._id,
       name: user.name,
       email: user.email,
-      profilePhoto: profilePhoto || photoUrl || '',
-      approvalStatus: 'pending'
+      profilePhoto: profilePhoto,
+      approvalStatus: 'pending',
+      isActive:false
+
     }).save();
     
     // Notify all admins about new driver registration
@@ -385,46 +385,42 @@ app.post('/register', upload.single('driverPhoto'), async (req, res) => {
       return res.status(400).json({ error: "Invalid role" });
     }
 
-    // Check if driver role and photo is missing
+    // 🔒 Enforce photo ONLY for drivers
     if (role === 'driver' && !req.file) {
       return res.status(400).json({ error: "Driver profile photo is required" });
     }
 
-    // Check if user already exists
     const existingUser = await User.findOne({ email });
     if (existingUser) {
       return res.status(400).json({ error: "Email already registered" });
     }
 
-    // Hash password
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    // Prepare user data
-    const userData = {
+    // ✅ User has NO photo
+    const user = await User.create({
       name,
       email,
       password: hashedPassword,
       role,
-      authProvider: 'local',
-      profilePhoto: req.file ? `/uploads/${req.file.filename}` : null
-    };
+      authProvider: 'local'
+    });
 
-    // Create user with role-specific record
-    const user = await createUserWithRole(userData);
+    // ✅ Driver photo stored ONLY here
+    if (role === 'driver') {
+      await Driver.create({
+        userId: user._id,
+        profilePhoto: `/uploads/${req.file.filename}`,
+        approvalStatus: 'pending',
+        isActive: false
+      });
+    }
 
-    // Generate JWT
     const token = jwt.sign(
       { userId: user._id, role: user.role },
       JWT_SECRET,
       { expiresIn: "7d" }
     );
-
-    // Get approval status for drivers
-    let approvalStatus = 'approved'; // Default for customer/admin
-    if (role === 'driver') {
-      const driver = await Driver.findOne({ userId: user._id });
-      approvalStatus = driver.approvalStatus;
-    }
 
     res.status(201).json({
       message: "Registration successful",
@@ -433,10 +429,9 @@ app.post('/register', upload.single('driverPhoto'), async (req, res) => {
         id: user._id,
         name: user.name,
         email: user.email,
-        role: user.role,
-        photoUrl: user.photoUrl
+        role: user.role
       },
-      approvalStatus
+      requiresProfileCompletion: role === 'driver'
     });
 
   } catch (err) {
@@ -444,6 +439,7 @@ app.post('/register', upload.single('driverPhoto'), async (req, res) => {
     res.status(500).json({ error: "Registration failed" });
   }
 });
+
 
 // Manual Login
 app.post('/login', async (req, res) => {
@@ -500,7 +496,6 @@ app.post('/login', async (req, res) => {
         name: user.name,
         email: user.email,
         role: user.role,
-        photoUrl: user.photoUrl
       },
       approvalStatus,
       rejectionReason
@@ -555,9 +550,6 @@ app.post('/google-login', async (req, res) => {
     if (!user.googleId) {
       user.googleId = googleId;
       user.authProvider = 'google';
-      if (!user.photoUrl && picture) {
-        user.photoUrl = picture;
-      }
       await user.save();
     }
 
@@ -588,7 +580,6 @@ app.post('/google-login', async (req, res) => {
         name: user.name,
         email: user.email,
         role: user.role,
-        photoUrl: user.photoUrl
       },
       approvalStatus,
       rejectionReason
@@ -651,7 +642,6 @@ app.post('/google-signup', async (req, res) => {
       email,
       role,
       googleId,
-      photoUrl: picture,
       authProvider: 'google'
     });
 
@@ -670,7 +660,6 @@ app.post('/google-signup', async (req, res) => {
         name: user.name,
         email: user.email,
         role: user.role,
-        photoUrl: user.photoUrl
       },
       approvalStatus: 'approved' // Customer and admin are auto-approved
     });
@@ -730,7 +719,6 @@ app.post('/google-driver-signup', upload.single('driverPhoto'), async (req, res)
       email,
       role: 'driver',
       googleId,
-      photoUrl: picture,
       authProvider: 'google',
       profilePhoto: `/uploads/${req.file.filename}`
     });
@@ -750,7 +738,6 @@ app.post('/google-driver-signup', upload.single('driverPhoto'), async (req, res)
         name: user.name,
         email: user.email,
         role: user.role,
-        photoUrl: user.photoUrl
       },
       approvalStatus: 'pending'
     });
@@ -788,7 +775,6 @@ app.get('/verify-token', authMiddleware, async (req, res) => {
         name: user.name,
         email: user.email,
         role: user.role,
-        photoUrl: user.photoUrl
       },
       approvalStatus,
       rejectionReason
@@ -810,7 +796,7 @@ app.get('/admin/pending-drivers', authMiddleware, async (req, res) => {
     }
 
     const pendingDrivers = await Driver.find({ approvalStatus: 'pending' })
-      .populate('userId', 'name email photoUrl createdAt')
+      .populate('userId', 'name email createdAt')
       .sort({ createdAt: -1 });
 
     res.json(pendingDrivers);
