@@ -77,12 +77,12 @@ const upload = multer({
     fileSize: 10 * 1024 * 1024 // 10MB limit
   },
   fileFilter: (req, file, cb) => {
-    if (file.mimetype.startsWith('image/')) {
-      cb(null, true);
-    } else {
-      cb(new Error('Only image files are allowed!'), false);
-    }
+  if (!file.mimetype || !file.mimetype.startsWith('image/')) {
+    return cb(null, false);
   }
+  cb(null, true);
+}
+
 });
 
 // Connect DB
@@ -385,6 +385,10 @@ app.post('/register', upload.single('driverPhoto'), async (req, res) => {
       return res.status(400).json({ error: "Invalid role" });
     }
 
+    if (role === 'driver' && !req.file) {
+  return res.status(400).json({ error: "Valid image file is required" });
+}
+
     // 🔒 Enforce photo ONLY for drivers
     if (role === 'driver' && !req.file) {
       return res.status(400).json({ error: "Driver profile photo is required" });
@@ -408,13 +412,16 @@ app.post('/register', upload.single('driverPhoto'), async (req, res) => {
 
     // ✅ Driver photo stored ONLY here
     if (role === 'driver') {
-      await Driver.create({
-        userId: user._id,
-        profilePhoto: `/uploads/${req.file.filename}`,
-        approvalStatus: 'pending',
-        isActive: false
-      });
-    }
+  await Driver.create({
+    userId: user._id,
+    name: user.name,
+    email: user.email,
+    profilePhoto: `/uploads/${req.file.filename}`,
+    approvalStatus: 'pending',
+    isActive: false
+  });
+}
+
 
     const token = jwt.sign(
       { userId: user._id, role: user.role },
@@ -439,6 +446,8 @@ app.post('/register', upload.single('driverPhoto'), async (req, res) => {
     res.status(500).json({ error: "Registration failed" });
   }
 });
+
+
 
 
 // Manual Login
