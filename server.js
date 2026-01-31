@@ -2,16 +2,15 @@ require('dotenv').config();
 
 const express = require('express');
 const mongoose = require('mongoose');
-const bcrypt = require('bcryptjs');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const { OAuth2Client } = require('google-auth-library');
-const sendAdminEmail = require("./utils/mailer");
 const http = require('http');
 const { Server } = require('socket.io');
+const cloudinary = require('cloudinary').v2;
+const admin = require('firebase-admin');
 
 const app = express();
 const server = http.createServer(app);
@@ -38,20 +37,23 @@ app.use('/uploads', express.static('uploads'));
 
 const JWT_SECRET = process.env.JWT_SECRET;
 const atlasUri = process.env.MONGO_URI;
+const TEST_MODE = process.env.TEST_MODE === 'true';
+const TEST_OTP = process.env.TEST_OTP || '123456';
 
-// Multiple Google Client IDs for different platforms
-const GOOGLE_CLIENT_IDS = {
-  web: process.env.GOOGLE_CLIENT_ID_WEB,
-  android: process.env.GOOGLE_CLIENT_ID_ANDROID,
-  ios: process.env.GOOGLE_CLIENT_ID_IOS
-};
+// Configure Cloudinary
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
+});
 
-// Create OAuth2Client instances for each platform
-const googleClients = {
-  web: new OAuth2Client(GOOGLE_CLIENT_IDS.web),
-  android: new OAuth2Client(GOOGLE_CLIENT_IDS.android),
-  ios: new OAuth2Client(GOOGLE_CLIENT_IDS.ios)
-};
+// Initialize Firebase Admin (if not in test mode)
+if (!TEST_MODE) {
+  const serviceAccount = require(process.env.FIREBASE_SERVICE_ACCOUNT_PATH || './firebase-service-account.json');
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount)
+  });
+}
 
 // Ensure uploads directory exists
 const uploadsDir = path.join(__dirname, 'uploads');
@@ -74,15 +76,14 @@ const storage = multer.diskStorage({
 const upload = multer({ 
   storage,
   limits: {
-    fileSize: 10 * 1024 * 1024 // 10MB limit
+    fileSize: 5 * 1024 * 1024 // 5MB limit
   },
   fileFilter: (req, file, cb) => {
-  if (!file.mimetype || !file.mimetype.startsWith('image/')) {
-    return cb(null, false);
+    if (!file.mimetype || !file.mimetype.startsWith('image/')) {
+      return cb(new Error('Only image files are allowed'), false);
+    }
+    cb(null, true);
   }
-  cb(null, true);
-}
-
 });
 
 // Connect DB
@@ -93,25 +94,45 @@ mongoose.connect(atlasUri)
 // ==================== DATABASE SCHEMAS ====================
 
 const UserSchema = new mongoose.Schema({
-  name: { type: String, required: true },
-  email: { type: String, unique: true, required: true, index: true },
-  password: { type: String },
+  phone: { type: String, unique: true, required: true, index: true },
   role: { type: String, enum: ['admin', 'customer', 'driver'], required: true, index: true },
-  googleId: { type: String, unique: true, sparse: true, index: true },
-  authProvider: { type: String, enum: ['local', 'google'], default: 'local' },
-  createdAt: { type: Date, default: Date.now }
+  createdAt: { type: Date, default: Date.now },
+  lastLoginAt: { type: Date, default: Date.now }
 });
 
 const User = mongoose.model("User", UserSchema);
 
-// ENHANCED DRIVER SCHEMA with approval workflow
+const AdminSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, unique: true },
+  name: { type: String, required: true },
+  phone: { type: String, required: true },
+  createdAt: { type: Date, default: Date.now }
+});
+
+const Admin = mongoose.model("Admin", AdminSchema);
+
+const CustomerSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, unique: true },
+  name: { type: String, required: true },
+  phone: { type: String, required: true },
+  stats: {
+    totalOrders: { type: Number, default: 0 },
+    completedOrders: { type: Number, default: 0 }
+  },
+  createdAt: { type: Date, default: Date.now }
+});
+
+const Customer = mongoose.model("Customer", CustomerSchema);
+
 const DriverSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, unique: true },
   name: { type: String, required: true },
-  email: { type: String, required: true },
-  profilePhoto: { type: String, required: true }, // Required during registration
+  phone: { type: String, required: true },
+  fatherName: { type: String, required: true },
+  drivingLicense: { type: String, required: true }, // Cloudinary URL
+  aadhar: { type: String, required: true }, // Cloudinary URL
+  selfie: { type: String, required: true }, // Cloudinary URL
   
-  // Approval Status: 'pending', 'approved', 'rejected'
   approvalStatus: { 
     type: String, 
     enum: ['pending', 'approved', 'rejected'], 
@@ -119,10 +140,11 @@ const DriverSchema = new mongoose.Schema({
     index: true 
   },
   
-  isActive: { type: Boolean, default: false }, // Only matters after approval
-  rejectionReason: { type: String }, // If rejected, admin can provide reason
+  isActive: { type: Boolean, default: false },
+  rejectionReason: { type: String },
   approvedAt: { type: Date },
-  approvedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" }, // Admin who approved
+  approvedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+  rejectedAt: { type: Date },
   
   lastActiveAt: { type: Date, default: Date.now },
   currentLocation: {
@@ -139,24 +161,24 @@ const DriverSchema = new mongoose.Schema({
 
 const Driver = mongoose.model("Driver", DriverSchema);
 
-const CustomerSchema = new mongoose.Schema({
-  userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, unique: true },
-  name: { type: String, required: true },
-  email: { type: String, required: true },
-  phone: { type: String },
-  stats: {
-    totalOrders: { type: Number, default: 0 },
-    completedOrders: { type: Number, default: 0 }
-  },
+const OTPSchema = new mongoose.Schema({
+  phone: { type: String, required: true, index: true },
+  otp: { type: String, required: true },
+  expiresAt: { type: Date, required: true, index: true },
+  verified: { type: Boolean, default: false },
+  attempts: { type: Number, default: 0 },
   createdAt: { type: Date, default: Date.now }
 });
 
-const Customer = mongoose.model("Customer", CustomerSchema);
+// Auto-delete expired OTPs
+OTPSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+
+const OTP = mongoose.model("OTP", OTPSchema);
 
 const OrderSchema = new mongoose.Schema({
   customerId: { type: mongoose.Schema.Types.ObjectId, ref: "Customer", required: true },
   customerName: { type: String, required: true },
-  customerEmail: { type: String, required: true },
+  customerPhone: { type: String, required: true },
   pickupLocation: { type: String, required: true },
   dropLocation: { type: String, required: true },
   pickupDateTime: { type: Date, required: true },
@@ -199,16 +221,6 @@ const NotificationSchema = new mongoose.Schema({
 });
 
 const Notification = mongoose.model("Notification", NotificationSchema);
-
-const CustomerIntentSchema = new mongoose.Schema({
-  name: { type: String, required: true },
-  phone: { type: String, required: true },
-  email: { type: String, required: true },
-  message: { type: String },
-  createdAt: { type: Date, default: Date.now }
-});
-
-const CustomerIntent = mongoose.model("customer_intent", CustomerIntentSchema);
 
 // ==================== WEBSOCKET SETUP ====================
 
@@ -291,6 +303,48 @@ function emitToAdmins(event, data) {
   io.to('admin').emit(event, data);
 }
 
+// ==================== HELPER FUNCTIONS ====================
+
+// Validate Indian phone number format
+function validatePhone(phone) {
+  const regex = /^\+91[6-9]\d{9}$/;
+  return regex.test(phone);
+}
+
+// Generate 6-digit OTP
+function generateOTP() {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+}
+
+// Upload file to Cloudinary
+async function uploadToCloudinary(filePath, folder) {
+  try {
+    const result = await cloudinary.uploader.upload(filePath, {
+      folder: folder,
+      resource_type: 'image'
+    });
+    
+    // Delete local file after upload
+    fs.unlinkSync(filePath);
+    
+    return result.secure_url;
+  } catch (error) {
+    console.error('Cloudinary upload error:', error);
+    throw new Error('File upload failed');
+  }
+}
+
+// Check rate limiting for OTP
+async function checkOTPRateLimit(phone) {
+  const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+  const recentOTPs = await OTP.countDocuments({
+    phone: phone,
+    createdAt: { $gte: oneHourAgo }
+  });
+  
+  return recentOTPs < 3; // Max 3 OTPs per hour
+}
+
 // ==================== AUTH MIDDLEWARE ====================
 
 function authMiddleware(req, res, next) {
@@ -313,42 +367,300 @@ function authMiddleware(req, res, next) {
   }
 }
 
-// ==================== HELPER FUNCTIONS ====================
+// ==================== AUTHENTICATION ENDPOINTS ====================
 
-async function createUserWithRole(userData) {
-  const { name, email, password, role, googleId, authProvider, profilePhoto } = userData;
-  
-  // Create user account
-  const user = new User({
-    name,
-    email,
-    password,
-    role,
-    googleId,
-    authProvider: authProvider || 'local'
-  });
-  
-  await user.save();
-  
-  // Create role-specific record
-  if (role === 'customer') {
-    await new Customer({
-      userId: user._id,
-      name: user.name,
-      email: user.email
-    }).save();
-  } else if (role === 'driver') {
-    await new Driver({
-      userId: user._id,
-      name: user.name,
-      email: user.email,
-      profilePhoto: profilePhoto,
-      approvalStatus: 'pending',
-      isActive:false
+// Send OTP to phone number
+app.post('/send-otp', async (req, res) => {
+  try {
+    const { phone } = req.body;
 
-    }).save();
+    if (!phone) {
+      return res.status(400).json({ error: "Phone number is required" });
+    }
+
+    // Validate phone format
+    if (!validatePhone(phone)) {
+      return res.status(400).json({ error: "Invalid phone number format. Use +91XXXXXXXXXX" });
+    }
+
+    // Check rate limiting
+    const canSendOTP = await checkOTPRateLimit(phone);
+    if (!canSendOTP) {
+      return res.status(429).json({ error: "Too many OTP requests. Please try after 1 hour." });
+    }
+
+    // Generate OTP
+    const otp = TEST_MODE ? TEST_OTP : generateOTP();
     
-    // Notify all admins about new driver registration
+    // Save OTP to database
+    const otpDoc = new OTP({
+      phone: phone,
+      otp: otp,
+      expiresAt: new Date(Date.now() + 10 * 60 * 1000), // 10 minutes
+      verified: false,
+      attempts: 0
+    });
+    await otpDoc.save();
+
+    // Send OTP via Firebase (skip in test mode)
+    if (!TEST_MODE) {
+      // Firebase will handle SMS sending
+      console.log(`OTP sent to ${phone}: ${otp}`);
+    } else {
+      console.log(`TEST MODE: OTP for ${phone}: ${otp}`);
+    }
+
+    res.json({ 
+      success: true, 
+      message: "OTP sent successfully",
+      expiresIn: 600 // seconds
+    });
+
+  } catch (err) {
+    console.error("Send OTP error:", err);
+    res.status(500).json({ error: "Failed to send OTP" });
+  }
+});
+
+// Verify OTP and login/signup
+app.post('/verify-otp', async (req, res) => {
+  try {
+    const { phone, otp } = req.body;
+
+    if (!phone || !otp) {
+      return res.status(400).json({ error: "Phone and OTP are required" });
+    }
+
+    // Find latest non-expired OTP
+    const otpDoc = await OTP.findOne({
+      phone: phone,
+      verified: false,
+      expiresAt: { $gt: new Date() }
+    }).sort({ createdAt: -1 });
+
+    if (!otpDoc) {
+      return res.status(400).json({ error: "OTP expired or not found" });
+    }
+
+    // Check attempts
+    if (otpDoc.attempts >= 3) {
+      return res.status(429).json({ error: "Maximum attempts exceeded" });
+    }
+
+    // Verify OTP
+    if (otpDoc.otp !== otp) {
+      otpDoc.attempts += 1;
+      await otpDoc.save();
+      return res.status(400).json({ error: "Invalid OTP" });
+    }
+
+    // Mark OTP as verified
+    otpDoc.verified = true;
+    await otpDoc.save();
+
+    // Check if user exists
+    let user = await User.findOne({ phone: phone });
+
+    if (user) {
+      // Existing user - login
+      user.lastLoginAt = new Date();
+      await user.save();
+
+      let roleData = null;
+      let approvalStatus = 'approved';
+      let rejectionReason = null;
+
+      if (user.role === 'customer') {
+        roleData = await Customer.findOne({ userId: user._id });
+      } else if (user.role === 'driver') {
+        const driver = await Driver.findOne({ userId: user._id });
+        if (driver) {
+          roleData = driver;
+          approvalStatus = driver.approvalStatus;
+          rejectionReason = driver.rejectionReason;
+        }
+      } else if (user.role === 'admin') {
+        roleData = await Admin.findOne({ userId: user._id });
+      }
+
+      // Generate JWT token (30 days expiry)
+      const token = jwt.sign(
+        { userId: user._id, role: user.role },
+        JWT_SECRET,
+        { expiresIn: "30d" }
+      );
+
+      res.json({
+        success: true,
+        isNewUser: false,
+        token: token,
+        user: {
+          id: user._id,
+          phone: user.phone,
+          role: user.role,
+          name: roleData ? roleData.name : null
+        },
+        approvalStatus: approvalStatus,
+        rejectionReason: rejectionReason
+      });
+
+    } else {
+      // New user - need signup
+      res.json({
+        success: true,
+        isNewUser: true,
+        phone: phone,
+        message: "Please complete signup"
+      });
+    }
+
+  } catch (err) {
+    console.error("Verify OTP error:", err);
+    res.status(500).json({ error: "OTP verification failed" });
+  }
+});
+
+// Complete customer signup
+app.post('/customer-signup', async (req, res) => {
+  try {
+    const { phone, name } = req.body;
+
+    if (!phone || !name) {
+      return res.status(400).json({ error: "Phone and name are required" });
+    }
+
+    // Validate phone
+    if (!validatePhone(phone)) {
+      return res.status(400).json({ error: "Invalid phone number" });
+    }
+
+    // Check if user already exists
+    const existingUser = await User.findOne({ phone: phone });
+    if (existingUser) {
+      return res.status(409).json({ error: "Phone number already registered" });
+    }
+
+    // Verify OTP was verified recently (within last 5 minutes)
+    const recentOTP = await OTP.findOne({
+      phone: phone,
+      verified: true,
+      createdAt: { $gte: new Date(Date.now() - 5 * 60 * 1000) }
+    }).sort({ createdAt: -1 });
+
+    if (!recentOTP) {
+      return res.status(400).json({ error: "Please verify OTP first" });
+    }
+
+    // Create User record
+    const user = new User({
+      phone: phone,
+      role: 'customer'
+    });
+    await user.save();
+
+    // Create Customer record
+    const customer = new Customer({
+      userId: user._id,
+      name: name,
+      phone: phone
+    });
+    await customer.save();
+
+    // Generate JWT token
+    const token = jwt.sign(
+      { userId: user._id, role: user.role },
+      JWT_SECRET,
+      { expiresIn: "30d" }
+    );
+
+    res.status(201).json({
+      success: true,
+      message: "Customer registration successful",
+      token: token,
+      user: {
+        id: user._id,
+        phone: user.phone,
+        role: user.role,
+        name: customer.name
+      }
+    });
+
+  } catch (err) {
+    console.error("Customer signup error:", err);
+    res.status(500).json({ error: "Customer registration failed" });
+  }
+});
+
+// Complete driver signup with documents
+app.post('/driver-signup', upload.fields([
+  { name: 'drivingLicense', maxCount: 1 },
+  { name: 'aadhar', maxCount: 1 },
+  { name: 'selfie', maxCount: 1 }
+]), async (req, res) => {
+  try {
+    const { phone, name, fatherName } = req.body;
+
+    if (!phone || !name || !fatherName) {
+      return res.status(400).json({ error: "Phone, name, and father's name are required" });
+    }
+
+    // Validate phone
+    if (!validatePhone(phone)) {
+      return res.status(400).json({ error: "Invalid phone number" });
+    }
+
+    // Check if all files are uploaded
+    if (!req.files || !req.files.drivingLicense || !req.files.aadhar || !req.files.selfie) {
+      return res.status(400).json({ error: "All documents (DL, Aadhar, Selfie) are required" });
+    }
+
+    // Check if user already exists
+    const existingUser = await User.findOne({ phone: phone });
+    if (existingUser) {
+      return res.status(409).json({ error: "Phone number already registered" });
+    }
+
+    // Verify OTP was verified recently
+    const recentOTP = await OTP.findOne({
+      phone: phone,
+      verified: true,
+      createdAt: { $gte: new Date(Date.now() - 5 * 60 * 1000) }
+    }).sort({ createdAt: -1 });
+
+    if (!recentOTP) {
+      return res.status(400).json({ error: "Please verify OTP first" });
+    }
+
+    // Upload documents to Cloudinary
+    const dlPath = req.files.drivingLicense[0].path;
+    const aadharPath = req.files.aadhar[0].path;
+    const selfiePath = req.files.selfie[0].path;
+
+    const dlUrl = await uploadToCloudinary(dlPath, 'drivetics/drivers/dl');
+    const aadharUrl = await uploadToCloudinary(aadharPath, 'drivetics/drivers/aadhar');
+    const selfieUrl = await uploadToCloudinary(selfiePath, 'drivetics/drivers/selfie');
+
+    // Create User record
+    const user = new User({
+      phone: phone,
+      role: 'driver'
+    });
+    await user.save();
+
+    // Create Driver record
+    const driver = new Driver({
+      userId: user._id,
+      name: name,
+      phone: phone,
+      fatherName: fatherName,
+      drivingLicense: dlUrl,
+      aadhar: aadharUrl,
+      selfie: selfieUrl,
+      approvalStatus: 'pending'
+    });
+    await driver.save();
+
+    // Notify all admins
     const admins = await User.find({ role: 'admin' });
     for (let admin of admins) {
       await new Notification({
@@ -358,435 +670,75 @@ async function createUserWithRole(userData) {
         type: 'approval'
       }).save();
     }
-    
+
     emitToAdmins('driver:new_registration', {
-      driverId: user._id,
-      name: user.name,
-      email: user.email
-    });
-  }
-  // Admin role doesn't need additional record
-  
-  return user;
-}
-
-// ==================== AUTHENTICATION ENDPOINTS ====================
-
-// Manual Registration
-app.post('/register', upload.single('driverPhoto'), async (req, res) => {
-  try {
-    const { name, email, password, role } = req.body;
-
-    if (!name || !email || !password || !role) {
-      return res.status(400).json({ error: "All fields are required" });
-    }
-
-    if (!['customer', 'driver', 'admin'].includes(role)) {
-      return res.status(400).json({ error: "Invalid role" });
-    }
-
-    if (role === 'driver' && !req.file) {
-  return res.status(400).json({ error: "Valid image file is required" });
-}
-
-    // 🔒 Enforce photo ONLY for drivers
-    if (role === 'driver' && !req.file) {
-      return res.status(400).json({ error: "Driver profile photo is required" });
-    }
-
-    const existingUser = await User.findOne({ email });
-    if (existingUser) {
-      return res.status(400).json({ error: "Email already registered" });
-    }
-
-    const hashedPassword = await bcrypt.hash(password, 10);
-
-    // ✅ User has NO photo
-    const user = await User.create({
-      name,
-      email,
-      password: hashedPassword,
-      role,
-      authProvider: 'local'
+      driverId: driver._id,
+      name: driver.name,
+      phone: driver.phone
     });
 
-    // ✅ Driver photo stored ONLY here
-    if (role === 'driver') {
-  await Driver.create({
-    userId: user._id,
-    name: user.name,
-    email: user.email,
-    profilePhoto: `/uploads/${req.file.filename}`,
-    approvalStatus: 'pending',
-    isActive: false
-  });
-}
-
-
+    // Generate JWT token
     const token = jwt.sign(
       { userId: user._id, role: user.role },
       JWT_SECRET,
-      { expiresIn: "7d" }
+      { expiresIn: "30d" }
     );
 
     res.status(201).json({
-      message: "Registration successful",
-      token,
-      user: {
-        id: user._id,
-        name: user.name,
-        email: user.email,
-        role: user.role
-      },
-      requiresProfileCompletion: role === 'driver'
-    });
-
-  } catch (err) {
-    console.error("Registration error:", err);
-    res.status(500).json({ error: "Registration failed" });
-  }
-});
-
-
-
-
-// Manual Login
-app.post('/login', async (req, res) => {
-  try {
-    const { email, password } = req.body;
-
-    if (!email || !password) {
-      return res.status(400).json({ error: "Email and password are required" });
-    }
-
-    // Find user
-    const user = await User.findOne({ email });
-    if (!user) {
-      return res.status(400).json({ error: "Invalid email or password" });
-    }
-
-    // Check if account uses Google auth
-    if (user.authProvider === 'google') {
-      return res.status(400).json({ 
-        error: "This account uses Google Sign-In. Please use 'Sign in with Google'" 
-      });
-    }
-
-    // Verify password
-    const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) {
-      return res.status(400).json({ error: "Invalid email or password" });
-    }
-
-    // Generate JWT
-    const token = jwt.sign(
-      { userId: user._id, role: user.role },
-      JWT_SECRET,
-      { expiresIn: "7d" }
-    );
-
-    // Get approval status for drivers
-    let approvalStatus = 'approved';
-    let rejectionReason = null;
-    
-    if (user.role === 'driver') {
-      const driver = await Driver.findOne({ userId: user._id });
-      if (driver) {
-        approvalStatus = driver.approvalStatus;
-        rejectionReason = driver.rejectionReason;
-      }
-    }
-
-    res.json({
-      message: "Login successful",
-      token,
-      user: {
-        id: user._id,
-        name: user.name,
-        email: user.email,
-        role: user.role,
-      },
-      approvalStatus,
-      rejectionReason
-    });
-
-  } catch (err) {
-    console.error("Login error:", err);
-    res.status(500).json({ error: "Login failed" });
-  }
-});
-
-// Google Sign-In (for existing users)
-app.post('/google-login', async (req, res) => {
-  try {
-    const { idToken, platform = 'android' } = req.body;
-
-    if (!idToken) {
-      return res.status(400).json({ error: "ID token is required" });
-    }
-
-    // Verify the Google ID token
-    const client = googleClients[platform] || googleClients.android;
-    
-    let ticket;
-    try {
-      ticket = await client.verifyIdToken({
-        idToken,
-        audience: [
-          GOOGLE_CLIENT_IDS.web,
-          GOOGLE_CLIENT_IDS.android,
-          GOOGLE_CLIENT_IDS.ios
-        ].filter(Boolean)
-      });
-    } catch (verifyError) {
-      console.error("Token verification error:", verifyError);
-      return res.status(400).json({ error: "Invalid Google token" });
-    }
-
-    const payload = ticket.getPayload();
-    const { sub: googleId, email, name, picture } = payload;
-
-    // Find user by Google ID or email
-    let user = await User.findOne({ $or: [{ googleId }, { email }] });
-
-    if (!user) {
-      return res.status(404).json({ 
-        error: "No account found. Please sign up first." 
-      });
-    }
-
-    // If found by email but not linked to Google, link it
-    if (!user.googleId) {
-      user.googleId = googleId;
-      user.authProvider = 'google';
-      await user.save();
-    }
-
-    // Generate JWT
-    const token = jwt.sign(
-      { userId: user._id, role: user.role },
-      JWT_SECRET,
-      { expiresIn: "7d" }
-    );
-
-    // Get approval status for drivers
-    let approvalStatus = 'approved';
-    let rejectionReason = null;
-    
-    if (user.role === 'driver') {
-      const driver = await Driver.findOne({ userId: user._id });
-      if (driver) {
-        approvalStatus = driver.approvalStatus;
-        rejectionReason = driver.rejectionReason;
-      }
-    }
-
-    res.json({
-      message: "Google sign-in successful",
-      token,
-      user: {
-        id: user._id,
-        name: user.name,
-        email: user.email,
-        role: user.role,
-      },
-      approvalStatus,
-      rejectionReason
-    });
-
-  } catch (err) {
-    console.error("Google login error:", err);
-    res.status(500).json({ error: "Google sign-in failed" });
-  }
-});
-
-// Google Sign-Up (for new customers and admins)
-app.post('/google-signup', async (req, res) => {
-  try {
-    const { idToken, role, platform = 'android' } = req.body;
-
-    if (!idToken || !role) {
-      return res.status(400).json({ error: "ID token and role are required" });
-    }
-
-    if (!['customer', 'admin'].includes(role)) {
-      return res.status(400).json({ 
-        error: "Invalid role. Drivers must use driver-specific signup." 
-      });
-    }
-
-    // Verify the Google ID token
-    const client = googleClients[platform] || googleClients.android;
-    
-    let ticket;
-    try {
-      ticket = await client.verifyIdToken({
-        idToken,
-        audience: [
-          GOOGLE_CLIENT_IDS.web,
-          GOOGLE_CLIENT_IDS.android,
-          GOOGLE_CLIENT_IDS.ios
-        ].filter(Boolean)
-      });
-    } catch (verifyError) {
-      console.error("Token verification error:", verifyError);
-      return res.status(400).json({ error: "Invalid Google token" });
-    }
-
-    const payload = ticket.getPayload();
-    const { sub: googleId, email, name, picture } = payload;
-
-    // Check if user already exists
-    let user = await User.findOne({ $or: [{ googleId }, { email }] });
-
-    if (user) {
-      return res.status(400).json({ 
-        error: "Account already exists. Please sign in." 
-      });
-    }
-
-    // Create new user with role-specific record
-    user = await createUserWithRole({
-      name,
-      email,
-      role,
-      googleId,
-      authProvider: 'google'
-    });
-
-    // Generate JWT
-    const token = jwt.sign(
-      { userId: user._id, role: user.role },
-      JWT_SECRET,
-      { expiresIn: "7d" }
-    );
-
-    res.status(201).json({
-      message: "Google sign-up successful",
-      token,
-      user: {
-        id: user._id,
-        name: user.name,
-        email: user.email,
-        role: user.role,
-      },
-      approvalStatus: 'approved' // Customer and admin are auto-approved
-    });
-
-  } catch (err) {
-    console.error("Google signup error:", err);
-    res.status(500).json({ error: "Google sign-up failed" });
-  }
-});
-
-// Google Driver Sign-Up (with photo upload)
-app.post('/google-driver-signup', upload.single('driverPhoto'), async (req, res) => {
-  try {
-    const { idToken, platform = 'android' } = req.body;
-
-    if (!idToken) {
-      return res.status(400).json({ error: "ID token is required" });
-    }
-
-    if (!req.file) {
-      return res.status(400).json({ error: "Driver profile photo is required" });
-    }
-
-    // Verify the Google ID token
-    const client = googleClients[platform] || googleClients.android;
-    
-    let ticket;
-    try {
-      ticket = await client.verifyIdToken({
-        idToken,
-        audience: [
-          GOOGLE_CLIENT_IDS.web,
-          GOOGLE_CLIENT_IDS.android,
-          GOOGLE_CLIENT_IDS.ios
-        ].filter(Boolean)
-      });
-    } catch (verifyError) {
-      console.error("Token verification error:", verifyError);
-      return res.status(400).json({ error: "Invalid Google token" });
-    }
-
-    const payload = ticket.getPayload();
-    const { sub: googleId, email, name, picture } = payload;
-
-    // Check if user already exists
-    let user = await User.findOne({ $or: [{ googleId }, { email }] });
-
-    if (user) {
-      return res.status(400).json({ 
-        error: "Account already exists. Please sign in." 
-      });
-    }
-
-    // Create new driver user
-    user = await createUserWithRole({
-      name,
-      email,
-      role: 'driver',
-      googleId,
-      authProvider: 'google',
-      profilePhoto: `/uploads/${req.file.filename}`
-    });
-
-    // Generate JWT
-    const token = jwt.sign(
-      { userId: user._id, role: user.role },
-      JWT_SECRET,
-      { expiresIn: "7d" }
-    );
-
-    res.status(201).json({
+      success: true,
       message: "Driver registration successful. Awaiting approval.",
-      token,
+      token: token,
       user: {
         id: user._id,
-        name: user.name,
-        email: user.email,
+        phone: user.phone,
         role: user.role,
+        name: driver.name
       },
       approvalStatus: 'pending'
     });
 
   } catch (err) {
-    console.error("Google driver signup error:", err);
+    console.error("Driver signup error:", err);
     res.status(500).json({ error: "Driver registration failed" });
   }
 });
 
-// Token Verification Endpoint
+// Token Verification
 app.get('/verify-token', authMiddleware, async (req, res) => {
   try {
-    const user = await User.findById(req.userId).select('-password');
+    const user = await User.findById(req.userId);
     
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
 
+    let roleData = null;
     let approvalStatus = 'approved';
     let rejectionReason = null;
-    
-    if (user.role === 'driver') {
+
+    if (user.role === 'customer') {
+      roleData = await Customer.findOne({ userId: user._id });
+    } else if (user.role === 'driver') {
       const driver = await Driver.findOne({ userId: user._id });
       if (driver) {
+        roleData = driver;
         approvalStatus = driver.approvalStatus;
         rejectionReason = driver.rejectionReason;
       }
+    } else if (user.role === 'admin') {
+      roleData = await Admin.findOne({ userId: user._id });
     }
 
     res.json({
       valid: true,
       user: {
         id: user._id,
-        name: user.name,
-        email: user.email,
+        phone: user.phone,
         role: user.role,
+        name: roleData ? roleData.name : null
       },
-      approvalStatus,
-      rejectionReason
+      approvalStatus: approvalStatus,
+      rejectionReason: rejectionReason
     });
 
   } catch (error) {
@@ -805,7 +757,7 @@ app.get('/admin/pending-drivers', authMiddleware, async (req, res) => {
     }
 
     const pendingDrivers = await Driver.find({ approvalStatus: 'pending' })
-      .populate('userId', 'name email createdAt')
+      .populate('userId', 'phone')
       .sort({ createdAt: -1 });
 
     res.json(pendingDrivers);
@@ -833,26 +785,25 @@ app.post('/admin/approve-driver/:driverId', authMiddleware, async (req, res) => 
     driver.rejectionReason = null;
     await driver.save();
 
-    // Notify the driver
+    // Notify driver
     await new Notification({
       userId: driver.userId,
-      title: "Account Approved",
-      message: "Your driver account has been approved! You can now start accepting rides.",
+      title: "Application Approved",
+      message: "Your driver application has been approved! You can now start accepting rides.",
       type: 'approval'
     }).save();
 
     emitToUser(driver.userId, 'driver:approved', {
-      message: 'Your account has been approved'
+      message: "Your application has been approved"
     });
 
     res.json({ 
-      message: 'Driver approved successfully',
-      driver 
+      success: true, 
+      message: "Driver approved successfully" 
     });
-
   } catch (error) {
     console.error('Approve driver error:', error);
-    res.status(500).json({ error: 'Approval failed' });
+    res.status(500).json({ error: 'Failed to approve driver' });
   }
 });
 
@@ -864,6 +815,9 @@ app.post('/admin/reject-driver/:driverId', authMiddleware, async (req, res) => {
     }
 
     const { reason } = req.body;
+    if (!reason) {
+      return res.status(400).json({ error: 'Rejection reason is required' });
+    }
 
     const driver = await Driver.findById(req.params.driverId);
     if (!driver) {
@@ -871,276 +825,55 @@ app.post('/admin/reject-driver/:driverId', authMiddleware, async (req, res) => {
     }
 
     driver.approvalStatus = 'rejected';
-    driver.rejectionReason = reason || 'Your application did not meet our requirements.';
+    driver.rejectionReason = reason;
+    driver.rejectedAt = new Date();
     await driver.save();
 
-    // Notify the driver
+    // Notify driver
     await new Notification({
       userId: driver.userId,
-      title: "Account Rejected",
-      message: driver.rejectionReason,
+      title: "Application Rejected",
+      message: `Your driver application has been rejected. Reason: ${reason}`,
       type: 'approval'
     }).save();
 
     emitToUser(driver.userId, 'driver:rejected', {
-      message: driver.rejectionReason
+      reason: reason
     });
 
     res.json({ 
-      message: 'Driver rejected',
-      driver 
+      success: true, 
+      message: "Driver rejected" 
     });
-
   } catch (error) {
     console.error('Reject driver error:', error);
-    res.status(500).json({ error: 'Rejection failed' });
+    res.status(500).json({ error: 'Failed to reject driver' });
   }
 });
 
-// ==================== ADMIN ENDPOINTS ====================
-
-app.get('/admin/all-orders', authMiddleware, async (req, res) => {
-  try {
-    if (req.userRole !== 'admin') {
-      return res.status(403).json({ error: 'Not authorized' });
-    }
-
-    const orders = await Order.find()
-      .sort({ createdAt: -1 })
-      .limit(100);
-
-    res.json(orders);
-  } catch (error) {
-    console.error('Get all orders error:', error);
-    res.status(500).json({ error: 'Failed to fetch orders' });
-  }
-});
-
-app.post('/admin/assign-drivers', authMiddleware, async (req, res) => {
-  try {
-    if (req.userRole !== 'admin') {
-      return res.status(403).json({ error: 'Not authorized' });
-    }
-
-    const { orderId, driverIds, cost } = req.body;
-
-    if (!orderId || !driverIds || !Array.isArray(driverIds) || driverIds.length === 0) {
-      return res.status(400).json({ error: 'Order ID and driver IDs are required' });
-    }
-
-    const order = await Order.findById(orderId);
-    if (!order) {
-      return res.status(404).json({ error: 'Order not found' });
-    }
-
-    // Clear existing assignments
-    order.assignments = [];
-
-    // Assign drivers
-    for (let driverId of driverIds) {
-      const driver = await Driver.findById(driverId);
-      if (driver && driver.approvalStatus === 'approved') {
-        order.assignments.push({
-          driverId: driver._id,
-          driverName: driver.name,
-          status: 'assigned'
-        });
-
-        // Notify driver
-        await new Notification({
-          userId: driver.userId,
-          title: 'New Assignment',
-          message: `You have been assigned to an order from ${order.pickupLocation} to ${order.dropLocation}`,
-          type: 'assignment',
-          orderId: order._id
-        }).save();
-
-        emitToUser(driver.userId, 'order:assigned', {
-          orderId: order._id,
-          order: order
-        });
-      }
-    }
-
-    order.status = 'assigned';
-    if (cost) {
-      order.cost = cost;
-    }
-    await order.save();
-
-    // Notify customer
-    const customer = await Customer.findById(order.customerId);
-    if (customer) {
-      await new Notification({
-        userId: customer.userId,
-        title: 'Drivers Assigned',
-        message: `Drivers have been assigned to your order`,
-        type: 'status',
-        orderId: order._id
-      }).save();
-
-      emitToUser(customer.userId, 'order:drivers_assigned', {
-        orderId: order._id,
-        driverCount: order.assignments.length
-      });
-    }
-
-    res.json({
-      message: 'Drivers assigned successfully',
-      order
-    });
-
-  } catch (error) {
-    console.error('Assign drivers error:', error);
-    res.status(500).json({ error: 'Assignment failed' });
-  }
-});
-
-// ==================== DRIVER ENDPOINTS ====================
-
-app.get('/driver/my-assignments', authMiddleware, async (req, res) => {
-  try {
-    if (req.userRole !== 'driver') {
-      return res.status(403).json({ error: 'Not authorized' });
-    }
-
-    const driver = await Driver.findOne({ userId: req.userId });
-    if (!driver) {
-      return res.status(404).json({ error: 'Driver profile not found' });
-    }
-
-    if (driver.approvalStatus !== 'approved') {
-      return res.status(403).json({ 
-        error: 'Account not approved',
-        approvalStatus: driver.approvalStatus 
-      });
-    }
-
-    const orders = await Order.find({
-      'assignments.driverId': driver._id,
-      status: { $ne: 'completed' }
-    }).sort({ createdAt: -1 });
-
-    res.json(orders);
-  } catch (error) {
-    console.error('Get driver assignments error:', error);
-    res.status(500).json({ error: 'Failed to fetch assignments' });
-  }
-});
-
-app.post('/driver/update-assignment-status', authMiddleware, async (req, res) => {
-  try {
-    if (req.userRole !== 'driver') {
-      return res.status(403).json({ error: 'Not authorized' });
-    }
-
-    const { orderId, status } = req.body;
-
-    if (!orderId || !status) {
-      return res.status(400).json({ error: 'Order ID and status are required' });
-    }
-
-    const driver = await Driver.findOne({ userId: req.userId });
-    if (!driver || driver.approvalStatus !== 'approved') {
-      return res.status(403).json({ error: 'Not authorized' });
-    }
-
-    const order = await Order.findById(orderId);
-    if (!order) {
-      return res.status(404).json({ error: 'Order not found' });
-    }
-
-    const assignment = order.assignments.find(
-      a => a.driverId.toString() === driver._id.toString()
-    );
-
-    if (!assignment) {
-      return res.status(404).json({ error: 'Assignment not found' });
-    }
-
-    assignment.status = status;
-    
-    if (status === 'in_transit' && !assignment.startedAt) {
-      assignment.startedAt = new Date();
-    } else if (status === 'completed') {
-      assignment.completedAt = new Date();
-      driver.stats.completedRides += 1;
-      await driver.save();
-    }
-
-    // Check if all assignments are completed
-    const allCompleted = order.assignments.every(a => a.status === 'completed');
-    if (allCompleted) {
-      order.status = 'completed';
-      order.completedAt = new Date();
-      
-      const customer = await Customer.findById(order.customerId);
-      if (customer) {
-        customer.stats.completedOrders += 1;
-        await customer.save();
-      }
-    } else if (status === 'in_transit' && order.status !== 'in_transit') {
-      order.status = 'in_transit';
-    }
-
-    await order.save();
-
-    // Notify customer and admin
-    const customer = await Customer.findById(order.customerId);
-    if (customer) {
-      await new Notification({
-        userId: customer.userId,
-        title: 'Order Update',
-        message: `Driver ${driver.name} updated status to ${status}`,
-        type: 'status',
-        orderId: order._id
-      }).save();
-
-      emitToUser(customer.userId, 'order:status_updated', {
-        orderId: order._id,
-        status: order.status
-      });
-    }
-
-    emitToAdmins('order:status_updated', {
-      orderId: order._id,
-      status: order.status
-    });
-
-    res.json({
-      message: 'Assignment status updated',
-      order
-    });
-
-  } catch (error) {
-    console.error('Update assignment status error:', error);
-    res.status(500).json({ error: 'Status update failed' });
-  }
-});
-
-// ==================== CUSTOMER ENDPOINTS ====================
+// ==================== ORDER ENDPOINTS ====================
 
 app.post('/orders/create', authMiddleware, async (req, res) => {
   try {
     if (req.userRole !== 'customer') {
-      return res.status(403).json({ error: "Access denied" });
-    }
-
-    const customer = await Customer.findOne({ userId: req.userId });
-    if (!customer) {
-      return res.status(404).json({ error: "Customer profile not found" });
+      return res.status(403).json({ error: "Only customers can create orders" });
     }
 
     const { pickupLocation, dropLocation, pickupDateTime, vehicleCount } = req.body;
 
     if (!pickupLocation || !dropLocation || !pickupDateTime || !vehicleCount) {
-      return res.status(400).json({ error: "All fields are required" });
+      return res.status(400).json({ error: "All order details are required" });
+    }
+
+    const customer = await Customer.findOne({ userId: req.userId });
+    if (!customer) {
+      return res.status(404).json({ error: "Customer not found" });
     }
 
     const newOrder = new Order({
       customerId: customer._id,
       customerName: customer.name,
-      customerEmail: customer.email,
+      customerPhone: customer.phone,
       pickupLocation,
       dropLocation,
       pickupDateTime: new Date(pickupDateTime),
@@ -1217,7 +950,7 @@ app.get('/orders/:id', authMiddleware, async (req, res) => {
 
 app.get('/profile', authMiddleware, async (req, res) => {
   try {
-    const user = await User.findById(req.userId).select('-password');
+    const user = await User.findById(req.userId);
     
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
@@ -1228,53 +961,21 @@ app.get('/profile', authMiddleware, async (req, res) => {
       roleData = await Customer.findOne({ userId: user._id });
     } else if (user.role === 'driver') {
       roleData = await Driver.findOne({ userId: user._id });
+    } else if (user.role === 'admin') {
+      roleData = await Admin.findOne({ userId: user._id });
     }
 
     res.json({
-      user,
-      roleData,
+      user: {
+        id: user._id,
+        phone: user.phone,
+        role: user.role
+      },
+      roleData: roleData
     });
   } catch (error) {
     console.error('Profile fetch error:', error);
     res.status(500).json({ error: 'Failed to fetch profile' });
-  }
-});
-
-app.put('/driver/profile', authMiddleware, async (req, res) => {
-  try {
-    if (req.userRole !== 'driver') {
-      return res.status(403).json({ error: 'Not authorized' });
-    }
-
-    const driver = await Driver.findOneAndUpdate(
-      { userId: req.userId },
-      { $set: req.body },
-      { new: true, runValidators: true }
-    );
-
-    res.json(driver);
-  } catch (error) {
-    console.error('Driver update error:', error);
-    res.status(500).json({ error: 'Update failed' });
-  }
-});
-
-app.put('/customer/profile', authMiddleware, async (req, res) => {
-  try {
-    if (req.userRole !== 'customer') {
-      return res.status(403).json({ error: 'Not authorized' });
-    }
-
-    const customer = await Customer.findOneAndUpdate(
-      { userId: req.userId },
-      { $set: req.body },
-      { new: true, runValidators: true }
-    );
-
-    res.json(customer);
-  } catch (error) {
-    console.error('Customer update error:', error);
-    res.status(500).json({ error: 'Update failed' });
   }
 });
 
@@ -1284,7 +985,8 @@ app.get('/admin/drivers', authMiddleware, async (req, res) => {
       return res.status(403).json({ error: 'Not authorized' });
     }
 
-    const drivers = await Driver.find({ approvalStatus: 'approved' }).populate('userId', 'name email');
+    const drivers = await Driver.find({ approvalStatus: 'approved' })
+      .populate('userId', 'phone');
     res.json(drivers);
   } catch (error) {
     console.error('Get drivers error:', error);
@@ -1298,7 +1000,7 @@ app.get('/admin/customers', authMiddleware, async (req, res) => {
       return res.status(403).json({ error: 'Not authorized' });
     }
 
-    const customers = await Customer.find().populate('userId', 'name email');
+    const customers = await Customer.find().populate('userId', 'phone');
     res.json(customers);
   } catch (error) {
     console.error('Get customers error:', error);
@@ -1328,61 +1030,6 @@ app.put('/notifications/:id/read', authMiddleware, async (req, res) => {
   }
 });
 
-app.post("/customer-intent", async (req, res) => {
-  try {
-    const { name, phone, email, message } = req.body;
-
-    if (!name || !phone || !email) {
-      return res.status(400).send("Missing required fields");
-    }
-
-    const intent = new CustomerIntent({
-      name,
-      phone,
-      email,
-      message
-    });
-    await intent.save();
-
-    await sendAdminEmail(
-      "📩 New Customer Intent | Drivetics",
-      `
-A new customer showed interest via website.
-
-Name: ${name}
-Phone: ${phone}
-Email: ${email}
-
-Message:
-${message || "No additional message"}
-      `
-    );
-
-    const admins = await User.find({ role: "admin" });
-    for (let admin of admins) {
-      await new Notification({
-        userId: admin._id,
-        title: "New Customer Intent",
-        message: `${name} submitted a pickup request`,
-        type: "order"
-      }).save();
-    }
-
-    emitToAdmins('customer_intent:new', {
-      name,
-      phone,
-      email,
-      message
-    });
-
-    res.json({ success: true });
-
-  } catch (err) {
-    console.error("CUSTOMER INTENT ERROR:", err.message);
-    res.status(500).send("Something went wrong. Please try again later.");
-  }
-});
-
 // ==================== START SERVER ====================
 
 const PORT = process.env.PORT || 8080;
@@ -1390,12 +1037,12 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`WebSocket server is ready`);
   console.log(`Uploads directory: ${uploadsDir}`);
+  console.log(`Test mode: ${TEST_MODE ? 'ENABLED' : 'DISABLED'}`);
   console.log('\n🔐 Authentication Endpoints:');
-  console.log('  POST /register - Manual registration');
-  console.log('  POST /login - Manual login');
-  console.log('  POST /google-login - Google sign-in');
-  console.log('  POST /google-signup - Google sign-up (customer/admin)');
-  console.log('  POST /google-driver-signup - Google driver sign-up with photo');
+  console.log('  POST /send-otp - Send OTP to phone');
+  console.log('  POST /verify-otp - Verify OTP and login/check if new user');
+  console.log('  POST /customer-signup - Complete customer registration');
+  console.log('  POST /driver-signup - Complete driver registration with documents');
   console.log('  GET  /verify-token - Verify JWT token\n');
   console.log('👮 Admin Endpoints:');
   console.log('  GET  /admin/pending-drivers - Get pending driver approvals');
