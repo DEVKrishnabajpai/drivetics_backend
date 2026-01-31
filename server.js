@@ -479,10 +479,7 @@ app.post('/customer-signup', async (req, res) => {
       return res.status(400).json({ error: "Phone and name are required" });
     }
 
-    // Validate phone
-    if (!validatePhone(phone)) {
-      return res.status(400).json({ error: "Invalid phone number" });
-    }
+    
 
     // Check if user already exists
     const existingUser = await User.findOne({ phone: phone });
