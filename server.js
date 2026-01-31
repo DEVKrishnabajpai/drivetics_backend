@@ -498,10 +498,15 @@ app.post('/customer-signup', async (req, res) => {
     } catch (err) {
       return res.status(401).json({ error: "Invalid Firebase token. Please verify your phone again." });
     }
-   const tokenPhone = decodedToken.phone_number.replace(/\D/g, "");
+ // Extract only digits from both phones
+const tokenPhone = decodedToken.phone_number.replace(/\D/g, "");
 const reqPhone = phone.replace(/\D/g, "");
 
-if (!tokenPhone.endsWith(reqPhone)) {
+// Extract last 10 digits for comparison (Indian phone numbers)
+const tokenLast10 = tokenPhone.slice(-10);
+const reqLast10 = reqPhone.slice(-10);
+
+if (tokenLast10 !== reqLast10) {
   return res.status(400).json({ error: "Token phone mismatch" });
 }
 
