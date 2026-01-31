@@ -307,7 +307,7 @@ function emitToAdmins(event, data) {
 
 // Validate Indian phone number format
 function validatePhone(phone) {
-  const regex = /^\+91[6-9]\d{9}$/;
+  const regex = /^\[6-9]\d{9}$/;
   return regex.test(phone);
 }
 
