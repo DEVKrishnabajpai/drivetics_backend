@@ -499,12 +499,36 @@ app.post('/customer-signup', async (req, res) => {
       return res.status(401).json({ error: "Invalid Firebase token. Please verify your phone again." });
     }
  // Extract only digits from both phones
+// const tokenPhone = decodedToken.phone_number.replace(/\D/g, "");
+// const reqPhone = phone.replace(/\D/g, "");
+
+// // Extract last 10 digits for comparison (Indian phone numbers)
+// const tokenLast10 = tokenPhone.slice(-10);
+// const reqLast10 = reqPhone.slice(-10);
+
+// if (tokenLast10 !== reqLast10) {
+//   return res.status(400).json({ error: "Token phone mismatch" });
+// }
+
+// Extract only digits from both phones
 const tokenPhone = decodedToken.phone_number.replace(/\D/g, "");
 const reqPhone = phone.replace(/\D/g, "");
+
+// ADD THESE LOGS FOR DEBUGGING:
+console.log("=== PHONE VERIFICATION DEBUG ===");
+console.log("Firebase token phone_number:", decodedToken.phone_number);
+console.log("Token phone (digits only):", tokenPhone);
+console.log("Request phone:", phone);
+console.log("Request phone (digits only):", reqPhone);
 
 // Extract last 10 digits for comparison (Indian phone numbers)
 const tokenLast10 = tokenPhone.slice(-10);
 const reqLast10 = reqPhone.slice(-10);
+
+console.log("Token last 10:", tokenLast10);
+console.log("Request last 10:", reqLast10);
+console.log("Match:", tokenLast10 === reqLast10);
+console.log("================================");
 
 if (tokenLast10 !== reqLast10) {
   return res.status(400).json({ error: "Token phone mismatch" });
