@@ -1020,6 +1020,17 @@ app.put('/notifications/:id/read', authMiddleware, async (req, res) => {
 // ==================== START SERVER ====================
 
 const PORT = process.env.PORT || 8080;
+
+// Add before server.listen()
+(async () => {
+  try {
+    await User.collection.dropIndex('email_1');
+    console.log('✅ Dropped email index');
+  } catch (err) {
+    console.log('Index already gone or error:', err.message);
+  }
+})();
+
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`WebSocket server is ready`);
