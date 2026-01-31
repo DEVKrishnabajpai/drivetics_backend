@@ -501,9 +501,12 @@ app.post('/customer-signup', async (req, res) => {
     } catch (err) {
       return res.status(401).json({ error: "Invalid Firebase token. Please verify your phone again." });
     }
-    if (decodedToken.phone_number !== phone) {
-      return res.status(400).json({ error: "Token phone mismatch" });
-    }
+   const tokenPhone = decodedToken.phone_number.replace(/\D/g, "");
+const reqPhone = phone.replace(/\D/g, "");
+
+if (!tokenPhone.endsWith(reqPhone)) {
+  return res.status(400).json({ error: "Token phone mismatch" });
+}
 
     // Create User record
     const user = new User({
