@@ -37,8 +37,7 @@ app.use('/uploads', express.static('uploads'));
 
 const JWT_SECRET = process.env.JWT_SECRET;
 const atlasUri = process.env.MONGO_URI;
-const TEST_MODE = process.env.TEST_MODE === 'true';
-const TEST_OTP = process.env.TEST_OTP || '123456';
+// TEST_MODE / TEST_OTP removed – Firebase Auth handles OTP entirely
 
 // Configure Cloudinary
 cloudinary.config({
@@ -47,22 +46,20 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
-// Initialize Firebase Admin (if not in test mode)
-if (!TEST_MODE) {
-  let serviceAccount;
+// Initialize Firebase Admin SDK
+let serviceAccount;
 
-  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-    // EC2 / Production (from env variable)
-    serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-  } else {
-    // Local development (from file)
-    serviceAccount = require('./firebase-service-account.json');
-  }
-
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount)
-  });
+if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+  // EC2 / Production (from env variable)
+  serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+} else {
+  // Local development (from file)
+  serviceAccount = require('./firebase-service-account.json');
 }
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount)
+});
 
 
 // Ensure uploads directory exists
@@ -171,19 +168,7 @@ const DriverSchema = new mongoose.Schema({
 
 const Driver = mongoose.model("Driver", DriverSchema);
 
-const OTPSchema = new mongoose.Schema({
-  phone: { type: String, required: true, index: true },
-  otp: { type: String, required: true },
-  expiresAt: { type: Date, required: true, index: true },
-  verified: { type: Boolean, default: false },
-  attempts: { type: Number, default: 0 },
-  createdAt: { type: Date, default: Date.now }
-});
-
-// Auto-delete expired OTPs
-OTPSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
-
-const OTP = mongoose.model("OTP", OTPSchema);
+// OTP schema removed – Firebase Auth handles OTP generation, delivery, and verification natively
 
 const OrderSchema = new mongoose.Schema({
   customerId: { type: mongoose.Schema.Types.ObjectId, ref: "Customer", required: true },
@@ -321,12 +306,7 @@ function validatePhone(phone) {
   return regex.test(phone);
 }
 
-// Generate 6-digit OTP
-function generateOTP() {
-  return Math.floor(100000 + Math.random() * 900000).toString();
-}
-
-// Upload file to Cloudinary
+// generateOTP / checkOTPRateLimit removed – Firebase Auth enforces its own rate limits
 async function uploadToCloudinary(filePath, folder) {
   try {
     const result = await cloudinary.uploader.upload(filePath, {
@@ -344,16 +324,7 @@ async function uploadToCloudinary(filePath, folder) {
   }
 }
 
-// Check rate limiting for OTP
-async function checkOTPRateLimit(phone) {
-  const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
-  const recentOTPs = await OTP.countDocuments({
-    phone: phone,
-    createdAt: { $gte: oneHourAgo }
-  });
-  
-  return recentOTPs < 3; // Max 3 OTPs per hour
-}
+
 
 // ==================== AUTH MIDDLEWARE ====================
 
@@ -379,7 +350,10 @@ function authMiddleware(req, res, next) {
 
 // ==================== AUTHENTICATION ENDPOINTS ====================
 
-// Send OTP to phone number
+// Send OTP – triggers Firebase phone auth on the CLIENT side.
+// This endpoint only validates the phone format so the client can
+// call FirebaseAuth.instance.verifyPhoneNumber() itself.
+// Firebase sends the SMS automatically; no OTP is stored server-side.
 app.post('/send-otp', async (req, res) => {
   try {
     const { phone } = req.body;
@@ -390,89 +364,55 @@ app.post('/send-otp', async (req, res) => {
 
     // Validate phone format
     if (!validatePhone(phone)) {
-      return res.status(400).json({ error: "Invalid phone number format.It can only start with 6/7/8/9" });
+      return res.status(400).json({ error: "Invalid phone number format. It can only start with 6/7/8/9" });
     }
 
-    // Check rate limiting
-    const canSendOTP = await checkOTPRateLimit(phone);
-    if (!canSendOTP) {
-      return res.status(429).json({ error: "Too many OTP requests. Please try after 1 hour." });
-    }
-
-    // Generate OTP
-    const otp = TEST_MODE ? TEST_OTP : generateOTP();
-    
-    // Save OTP to database
-    const otpDoc = new OTP({
-      phone: phone,
-      otp: otp,
-      expiresAt: new Date(Date.now() + 10 * 60 * 1000), // 10 minutes
-      verified: false,
-      attempts: 0
-    });
-    await otpDoc.save();
-
-    // Send OTP via Firebase (skip in test mode)
-    if (!TEST_MODE) {
-      // Firebase will handle SMS sending
-      console.log(`OTP sent to ${phone}: ${otp}`);
-    } else {
-      console.log(`TEST MODE: OTP for ${phone}: ${otp}`);
-    }
-
-    res.json({ 
-      success: true, 
-      message: "OTP sent successfully",
-      expiresIn: 600 // seconds
+    // Nothing else to do – the Flutter client will call
+    // FirebaseAuth.instance.verifyPhoneNumber() which triggers the SMS.
+    res.json({
+      success: true,
+      message: "Proceed with Firebase phone verification on client"
     });
 
   } catch (err) {
     console.error("Send OTP error:", err);
-    res.status(500).json({ error: "Failed to send OTP" });
+    res.status(500).json({ error: "Failed to process OTP request" });
   }
 });
 
-// Verify OTP and login/signup
+// Verify OTP – the client has already completed Firebase phone auth and
+// obtained a Firebase ID token.  We verify that token here with the
+// Firebase Admin SDK, extract the phone number, and then do the same
+// login / new-user logic as before.
 app.post('/verify-otp', async (req, res) => {
   try {
-    const { phone, otp } = req.body;
+    const { firebaseToken } = req.body;   // Firebase ID token from client
 
-    if (!phone || !otp) {
-      return res.status(400).json({ error: "Phone and OTP are required" });
+    if (!firebaseToken) {
+      return res.status(400).json({ error: "Firebase token is required" });
     }
 
-    // Find latest non-expired OTP
-    const otpDoc = await OTP.findOne({
-      phone: phone,
-      verified: false,
-      expiresAt: { $gt: new Date() }
-    }).sort({ createdAt: -1 });
-
-    if (!otpDoc) {
-      return res.status(400).json({ error: "OTP expired or not found" });
+    // ── 1. Verify the Firebase ID token ──────────────────────────
+    let decodedToken;
+    try {
+      decodedToken = await admin.auth().verifyIdToken(firebaseToken);
+    } catch (err) {
+      console.error("Firebase token verification failed:", err);
+      return res.status(401).json({ error: "Invalid or expired Firebase token" });
     }
 
-    // Check attempts
-    if (otpDoc.attempts >= 3) {
-      return res.status(429).json({ error: "Maximum attempts exceeded" });
+    const phone = decodedToken.phone_number;   // e.g. "+919307128962"
+    if (!phone) {
+      return res.status(400).json({ error: "Phone number not found in token" });
     }
 
-    // Verify OTP
-    if (otpDoc.otp !== otp) {
-      otpDoc.attempts += 1;
-      await otpDoc.save();
-      return res.status(400).json({ error: "Invalid OTP" });
-    }
+    console.log(`Firebase phone auth verified for: ${phone}`);
 
-    // Mark OTP as verified
-    otpDoc.verified = true;
-    await otpDoc.save();
-
-    // Check if user exists
+    // ── 2. Existing-user login  OR  new-user flag ────────────────
     let user = await User.findOne({ phone: phone });
 
     if (user) {
-      // Existing user - login
+      // Existing user – login
       user.lastLoginAt = new Date();
       await user.save();
 
@@ -515,7 +455,7 @@ app.post('/verify-otp', async (req, res) => {
       });
 
     } else {
-      // New user - need signup
+      // New user – tell the client to show role-selection
       res.json({
         success: true,
         isNewUser: true,
@@ -550,15 +490,19 @@ app.post('/customer-signup', async (req, res) => {
       return res.status(409).json({ error: "Phone number already registered" });
     }
 
-    // Verify OTP was verified recently (within last 5 minutes)
-    const recentOTP = await OTP.findOne({
-      phone: phone,
-      verified: true,
-      createdAt: { $gte: new Date(Date.now() - 5 * 60 * 1000) }
-    }).sort({ createdAt: -1 });
-
-    if (!recentOTP) {
-      return res.status(400).json({ error: "Please verify OTP first" });
+    // Verify the Firebase token is still valid for this phone
+    const { firebaseToken } = req.body;
+    if (!firebaseToken) {
+      return res.status(400).json({ error: "Firebase token is required for signup" });
+    }
+    let decodedToken;
+    try {
+      decodedToken = await admin.auth().verifyIdToken(firebaseToken);
+    } catch (err) {
+      return res.status(401).json({ error: "Invalid Firebase token. Please verify your phone again." });
+    }
+    if (decodedToken.phone_number !== phone) {
+      return res.status(400).json({ error: "Token phone mismatch" });
     }
 
     // Create User record
@@ -630,15 +574,19 @@ app.post('/driver-signup', upload.fields([
       return res.status(409).json({ error: "Phone number already registered" });
     }
 
-    // Verify OTP was verified recently
-    const recentOTP = await OTP.findOne({
-      phone: phone,
-      verified: true,
-      createdAt: { $gte: new Date(Date.now() - 5 * 60 * 1000) }
-    }).sort({ createdAt: -1 });
-
-    if (!recentOTP) {
-      return res.status(400).json({ error: "Please verify OTP first" });
+    // Verify the Firebase token is still valid for this phone
+    const { firebaseToken } = req.body;
+    if (!firebaseToken) {
+      return res.status(400).json({ error: "Firebase token is required for signup" });
+    }
+    let decodedToken;
+    try {
+      decodedToken = await admin.auth().verifyIdToken(firebaseToken);
+    } catch (err) {
+      return res.status(401).json({ error: "Invalid Firebase token. Please verify your phone again." });
+    }
+    if (decodedToken.phone_number !== phone) {
+      return res.status(400).json({ error: "Token phone mismatch" });
     }
 
     // Upload documents to Cloudinary
@@ -1047,7 +995,7 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`WebSocket server is ready`);
   console.log(`Uploads directory: ${uploadsDir}`);
-  console.log(`Test mode: ${TEST_MODE ? 'ENABLED' : 'DISABLED'}`);
+  console.log(`Test mode: DISABLED (using Firebase Auth)`);
   console.log('\n🔐 Authentication Endpoints:');
   console.log('  POST /send-otp - Send OTP to phone');
   console.log('  POST /verify-otp - Verify OTP and login/check if new user');
