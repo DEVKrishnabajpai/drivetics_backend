@@ -49,11 +49,21 @@ cloudinary.config({
 
 // Initialize Firebase Admin (if not in test mode)
 if (!TEST_MODE) {
-  const serviceAccount = require(process.env.FIREBASE_SERVICE_ACCOUNT_PATH || './firebase-service-account.json');
+  let serviceAccount;
+
+  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    // EC2 / Production (from env variable)
+    serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+  } else {
+    // Local development (from file)
+    serviceAccount = require('./firebase-service-account.json');
+  }
+
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount)
   });
 }
+
 
 // Ensure uploads directory exists
 const uploadsDir = path.join(__dirname, 'uploads');
