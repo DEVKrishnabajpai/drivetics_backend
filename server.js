@@ -317,7 +317,7 @@ function emitToAdmins(event, data) {
 
 // Validate Indian phone number format
 function validatePhone(phone) {
-  const regex = /^[6-9]\d{9}$/;
+  const regex = /^\+91[6-9]\d{9}$/;
   return regex.test(phone);
 }
 
@@ -390,7 +390,7 @@ app.post('/send-otp', async (req, res) => {
 
     // Validate phone format
     if (!validatePhone(phone)) {
-      return res.status(400).json({ error: "Invalid phone number format.It can only start with 6/9" });
+      return res.status(400).json({ error: "Invalid phone number format.It can only start with 6/7/8/9" });
     }
 
     // Check rate limiting
