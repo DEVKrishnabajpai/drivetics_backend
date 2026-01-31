@@ -581,14 +581,18 @@ app.post('/driver-signup', upload.fields([
   { name: 'selfie', maxCount: 1 }
 ]), async (req, res) => {
   try {
-    const { phone, name, fatherName } = req.body;
+    let { phone, name, fatherName } = req.body;
 
     if (!phone || !name || !fatherName) {
       return res.status(400).json({ error: "Phone, name, and father's name are required" });
     }
 
-    // Validate phone
-    if (!validatePhone(phone)) {
+    // Normalize phone to 10 digits, then add +91
+    phone = phone.replace(/\D/g, '').slice(-10);
+    const fullPhone = `+91${phone}`;
+
+    // Validate phone (10 digits starting with 6-9)
+    if (!/^[6-9]\d{9}$/.test(phone)) {
       return res.status(400).json({ error: "Invalid phone number" });
     }
 
@@ -598,7 +602,7 @@ app.post('/driver-signup', upload.fields([
     }
 
     // Check if user already exists
-    const existingUser = await User.findOne({ phone: phone });
+    const existingUser = await User.findOne({ phone: fullPhone });
     if (existingUser) {
       return res.status(409).json({ error: "Phone number already registered" });
     }
@@ -608,13 +612,26 @@ app.post('/driver-signup', upload.fields([
     if (!firebaseToken) {
       return res.status(400).json({ error: "Firebase token is required for signup" });
     }
+
     let decodedToken;
     try {
       decodedToken = await admin.auth().verifyIdToken(firebaseToken);
     } catch (err) {
+      console.error("Firebase token verification failed:", err);
       return res.status(401).json({ error: "Invalid Firebase token. Please verify your phone again." });
     }
-    if (decodedToken.phone_number !== phone) {
+
+    // Extract and compare last 10 digits
+    const tokenPhone = decodedToken.phone_number.replace(/\D/g, '').slice(-10);
+    
+    console.log("=== DRIVER SIGNUP PHONE VERIFICATION ===");
+    console.log("Token phone (last 10):", tokenPhone);
+    console.log("Request phone:", phone);
+    console.log("Match:", tokenPhone === phone);
+    console.log("======================================");
+    
+    if (tokenPhone !== phone) {
+      console.error("Phone mismatch - Token:", tokenPhone, "Request:", phone);
       return res.status(400).json({ error: "Token phone mismatch" });
     }
 
@@ -627,9 +644,9 @@ app.post('/driver-signup', upload.fields([
     const aadharUrl = await uploadToCloudinary(aadharPath, 'drivetics/drivers/aadhar');
     const selfieUrl = await uploadToCloudinary(selfiePath, 'drivetics/drivers/selfie');
 
-    // Create User record
+    // Create User record with +91 format
     const user = new User({
-      phone: phone,
+      phone: fullPhone,
       role: 'driver'
     });
     await user.save();
@@ -638,7 +655,7 @@ app.post('/driver-signup', upload.fields([
     const driver = new Driver({
       userId: user._id,
       name: name,
-      phone: phone,
+      phone: fullPhone,
       fatherName: fatherName,
       drivingLicense: dlUrl,
       aadhar: aadharUrl,
@@ -689,7 +706,6 @@ app.post('/driver-signup', upload.fields([
     res.status(500).json({ error: "Driver registration failed" });
   }
 });
-
 // Token Verification
 app.get('/verify-token', authMiddleware, async (req, res) => {
   try {
@@ -1021,15 +1037,6 @@ app.put('/notifications/:id/read', authMiddleware, async (req, res) => {
 
 const PORT = process.env.PORT || 8080;
 
-// Add before server.listen()
-(async () => {
-  try {
-    await User.collection.dropIndex('email_1');
-    console.log('✅ Dropped email index');
-  } catch (err) {
-    console.log('Index already gone or error:', err.message);
-  }
-})();
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on port ${PORT}`);
