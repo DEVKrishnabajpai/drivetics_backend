@@ -771,7 +771,7 @@ app.get('/admin/pending-drivers', authMiddleware, async (req, res) => {
 });
 
 // Approve driver
-app.post('/admin/approve-driver/:driverId', authMiddleware, async (req, res) => {
+app.put('/admin/approve-driver/:driverId', authMiddleware, async (req, res) => {
   try {
     if (req.userRole !== 'admin') {
       return res.status(403).json({ error: 'Not authorized' });
@@ -811,7 +811,7 @@ app.post('/admin/approve-driver/:driverId', authMiddleware, async (req, res) => 
 });
 
 // Reject driver
-app.post('/admin/reject-driver/:driverId', authMiddleware, async (req, res) => {
+app.put('/admin/reject-driver/:driverId', authMiddleware, async (req, res) => {
   try {
     if (req.userRole !== 'admin') {
       return res.status(403).json({ error: 'Not authorized' });
@@ -1008,6 +1008,71 @@ app.get('/admin/customers', authMiddleware, async (req, res) => {
   } catch (error) {
     console.error('Get customers error:', error);
     res.status(500).json({ error: 'Failed to fetch customers' });
+  }
+});
+
+// ==================== ADMIN DASHBOARD ====================
+
+// Get complete dashboard data (orders, drivers, customers, stats)
+app.get('/admin/dashboard', authMiddleware, async (req, res) => {
+  try {
+    if (req.userRole !== 'admin') {
+      return res.status(403).json({ error: 'Not authorized' });
+    }
+
+    // Fetch all orders with customer details
+    const orders = await Order.find()
+      .populate('customerId', 'name phone')
+      .sort({ createdAt: -1 });
+
+    // Fetch all approved drivers with their active status
+    const drivers = await Driver.find({ approvalStatus: 'approved' })
+      .populate('userId', 'phone');
+
+    // Fetch all customers
+    const customers = await Customer.find()
+      .populate('userId', 'phone');
+
+    // Calculate dashboard statistics
+    const stats = {
+      totalOrders: orders.length,
+      pendingOrders: orders.filter(o => o.status === 'pending').length,
+      assignedOrders: orders.filter(o => o.status === 'assigned').length,
+      inTransitOrders: orders.filter(o => o.status === 'in_transit').length,
+      completedOrders: orders.filter(o => o.status === 'completed').length,
+      totalDrivers: drivers.length,
+      activeDrivers: drivers.filter(d => d.isActive).length,
+      totalCustomers: customers.length,
+      pendingDrivers: await Driver.countDocuments({ approvalStatus: 'pending' })
+    };
+
+    res.json({
+      orders: orders,
+      drivers: drivers,
+      customers: customers,
+      stats: stats
+    });
+  } catch (error) {
+    console.error('Dashboard error:', error);
+    res.status(500).json({ error: 'Failed to fetch dashboard data' });
+  }
+});
+
+// Get pending driver requests for approval
+app.get('/admin/driver-requests', authMiddleware, async (req, res) => {
+  try {
+    if (req.userRole !== 'admin') {
+      return res.status(403).json({ error: 'Not authorized' });
+    }
+
+    const pendingDrivers = await Driver.find({ approvalStatus: 'pending' })
+      .populate('userId', 'phone')
+      .sort({ createdAt: -1 });
+
+    res.json(pendingDrivers);
+  } catch (error) {
+    console.error('Get driver requests error:', error);
+    res.status(500).json({ error: 'Failed to fetch driver requests' });
   }
 });
 
