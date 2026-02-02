@@ -949,6 +949,249 @@ app.get('/orders/:id', authMiddleware, async (req, res) => {
   }
 });
 
+// ==================== DRIVER ENDPOINTS ====================
+
+// Driver Dashboard - Get driver's info, assignments, and stats
+app.get('/driver/dashboard', authMiddleware, async (req, res) => {
+  try {
+    if (req.userRole !== 'driver') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const driver = await Driver.findOne({ userId: req.userId })
+      .populate('userId', 'phone');
+
+    if (!driver) {
+      return res.status(404).json({ error: 'Driver not found' });
+    }
+
+    // If driver is not approved yet, return limited info
+    if (driver.approvalStatus !== 'approved') {
+      return res.json({
+        approvalStatus: driver.approvalStatus,
+        rejectionReason: driver.rejectionReason,
+        profilePhoto: driver.selfie,
+        name: driver.name
+      });
+    }
+
+    // Driver is approved, return full dashboard
+    const myAssignments = await Order.find({
+      'assignments.driverId': driver._id
+    }).sort({ createdAt: -1 });
+
+    const activeOrders = myAssignments.filter(o => 
+      ['assigned', 'in_transit'].includes(o.status)
+    );
+    
+    const completedOrders = myAssignments.filter(o => 
+      o.status === 'completed'
+    );
+
+    res.json({
+      approvalStatus: driver.approvalStatus,
+      isActive: driver.isActive,
+      profilePhoto: driver.selfie,
+      name: driver.name,
+      phone: driver.phone,
+      stats: driver.stats,
+      activeOrders: activeOrders,
+      completedOrders: completedOrders,
+      allOrders: myAssignments
+    });
+  } catch (err) {
+    console.error('Driver dashboard error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Toggle driver active status
+app.put('/driver/toggle-status', authMiddleware, async (req, res) => {
+  try {
+    if (req.userRole !== 'driver') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const driver = await Driver.findOne({ userId: req.userId });
+    
+    if (!driver) {
+      return res.status(404).json({ error: 'Driver not found' });
+    }
+
+    if (driver.approvalStatus !== 'approved') {
+      return res.status(403).json({ error: 'Driver not approved yet' });
+    }
+
+    driver.isActive = !driver.isActive;
+    driver.lastActiveAt = new Date();
+    await driver.save();
+
+    // Notify admins
+    emitToAdmins('driver:status_updated', {
+      driverId: driver._id,
+      name: driver.name,
+      isActive: driver.isActive
+    });
+
+    res.json({ 
+      message: 'Status updated',
+      isActive: driver.isActive 
+    });
+  } catch (err) {
+    console.error('Toggle status error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Update driver location
+app.post('/driver/update-location', authMiddleware, async (req, res) => {
+  try {
+    if (req.userRole !== 'driver') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const { latitude, longitude } = req.body;
+    
+    if (!latitude || !longitude) {
+      return res.status(400).json({ error: 'Location data required' });
+    }
+
+    const driver = await Driver.findOne({ userId: req.userId });
+    
+    if (!driver) {
+      return res.status(404).json({ error: 'Driver not found' });
+    }
+
+    driver.currentLocation = {
+      latitude,
+      longitude,
+      updatedAt: new Date()
+    };
+    await driver.save();
+
+    // Notify admins
+    emitToAdmins('driver:location_updated', {
+      driverId: driver._id,
+      location: driver.currentLocation
+    });
+
+    res.json({ message: 'Location updated' });
+  } catch (err) {
+    console.error('Update location error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ==================== CUSTOMER ORDER ENDPOINTS (ALIASES) ====================
+
+// Customer orders - alias for /orders/my-orders
+app.get('/orders', authMiddleware, async (req, res) => {
+  try {
+    if (req.userRole !== 'customer') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const customer = await Customer.findOne({ userId: req.userId });
+    if (!customer) {
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+
+    const orders = await Order.find({ 
+      customerId: customer._id,
+      status: { $ne: 'completed' }
+    }).sort({ createdAt: -1 });
+
+    res.json(orders);
+  } catch (err) {
+    console.error('Get orders error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Customer order history
+app.get('/orders/history', authMiddleware, async (req, res) => {
+  try {
+    if (req.userRole !== 'customer') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const customer = await Customer.findOne({ userId: req.userId });
+    if (!customer) {
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+
+    const orders = await Order.find({ 
+      customerId: customer._id,
+      status: 'completed'
+    }).sort({ completedAt: -1 });
+
+    res.json(orders);
+  } catch (err) {
+    console.error('Get order history error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Create order - alias for /orders/create
+app.post('/orders', authMiddleware, async (req, res) => {
+  try {
+    if (req.userRole !== 'customer') {
+      return res.status(403).json({ error: "Only customers can create orders" });
+    }
+
+    const { pickupLocation, dropLocation, pickupDateTime, vehicleCount } = req.body;
+
+    if (!pickupLocation || !dropLocation || !pickupDateTime || !vehicleCount) {
+      return res.status(400).json({ error: "All order details are required" });
+    }
+
+    const customer = await Customer.findOne({ userId: req.userId });
+    if (!customer) {
+      return res.status(404).json({ error: "Customer not found" });
+    }
+
+    const newOrder = new Order({
+      customerId: customer._id,
+      customerName: customer.name,
+      customerPhone: customer.phone,
+      pickupLocation,
+      dropLocation,
+      pickupDateTime: new Date(pickupDateTime),
+      vehicleCount: parseInt(vehicleCount),
+      status: 'pending'
+    });
+
+    await newOrder.save();
+
+    customer.stats.totalOrders += 1;
+    await customer.save();
+
+    const admins = await User.find({ role: 'admin' });
+    for (let admin of admins) {
+      await new Notification({
+        userId: admin._id,
+        title: "New Order",
+        message: `${customer.name} placed a new order`,
+        type: 'order',
+        orderId: newOrder._id
+      }).save();
+    }
+
+    emitToAdmins('order:new', {
+      order: newOrder
+    });
+
+    res.status(201).json({ 
+      message: "Order placed successfully",
+      order: newOrder
+    });
+  } catch (err) {
+    console.error('Create order error:', err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+
 // ==================== PROFILE & NOTIFICATIONS ====================
 
 app.get('/profile', authMiddleware, async (req, res) => {
